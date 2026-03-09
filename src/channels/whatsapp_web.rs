@@ -358,13 +358,15 @@ impl Channel for WhatsAppWebChannel {
                                 let chat = info.source.chat.to_string();
 
                                 tracing::info!(
-                                    "WhatsApp Web message from {} in {} (len={})",
-                                    sender,
-                                    chat,
+                                    "WhatsApp Web message received (sender_len={}, chat_len={}, text_len={})",
+                                    sender.len(),
+                                    chat.len(),
                                     text.len()
                                 );
                                 tracing::debug!(
-                                    "WhatsApp Web message content: {}",
+                                    "WhatsApp Web message from {} in {}: {}",
+                                    sender,
+                                    chat,
                                     text
                                 );
 
@@ -412,7 +414,11 @@ impl Channel for WhatsAppWebChannel {
                                     }
                                 } else {
                                     tracing::warn!(
-                                        "WhatsApp Web: message from {} not in allowed list (candidates: {:?})",
+                                        "WhatsApp Web: message not in allowed list (candidate_count={})",
+                                        sender_candidates.len()
+                                    );
+                                    tracing::debug!(
+                                        "WhatsApp Web: rejected sender={} candidates={:?}",
                                         sender_jid,
                                         sender_candidates
                                     );
