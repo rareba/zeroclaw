@@ -3634,7 +3634,6 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     draft_update_interval_ms: 1000,
                     interrupt_on_new_message: false,
                     mention_only: true, // Defaulting to mention_only for new group setups is safer
-                    allow_group_mentions: true,
                     voice_messages,
                     whisper_model: None,
                 });

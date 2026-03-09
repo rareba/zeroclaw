@@ -312,6 +312,9 @@ pub struct TelegramChannel {
     transcription: Option<crate::config::TranscriptionConfig>,
     voice_transcriptions: Mutex<std::collections::HashMap<String, String>>,
     workspace_dir: Option<std::path::PathBuf>,
+    /// Whether Telegram-specific voice message parsing is enabled
+    /// (independent of Groq-based transcription config).
+    voice_messages_enabled: bool,
     whisper_model: Option<String>,
 }
 
