@@ -2897,14 +2897,14 @@ fn collect_configured_channels(
 
     #[cfg(feature = "channel-lark")]
     if let Some(ref lk) = config.channels_config.lark {
-        if lk.use_feishu {
+        if lk.platform == crate::config::schema::LarkPlatform::Feishu {
             if config.channels_config.feishu.is_some() {
                 tracing::warn!(
-                    "Both [channels_config.feishu] and legacy [channels_config.lark].use_feishu=true are configured; ignoring legacy Feishu fallback in lark."
+                    "Both [channels_config.feishu] and [channels_config.lark].platform=\"feishu\" are configured; ignoring lark-section Feishu fallback."
                 );
             } else {
                 tracing::warn!(
-                    "Using legacy [channels_config.lark].use_feishu=true compatibility path; prefer [channels_config.feishu]."
+                    "Using [channels_config.lark].platform=\"feishu\" compatibility path; prefer [channels_config.feishu]."
                 );
                 channels.push(ConfiguredChannel {
                     display_name: "Feishu",

@@ -55,11 +55,7 @@ enum LarkAckLocale {
     Ja,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LarkPlatform {
-    Lark,
-    Feishu,
-}
+use crate::config::schema::LarkPlatform;
 
 impl LarkPlatform {
     fn api_base(self) -> &'static str {
@@ -350,14 +346,8 @@ impl LarkChannel {
         }
     }
 
-    /// Build from `LarkConfig` using legacy compatibility:
-    /// when `use_feishu=true`, this instance routes to Feishu endpoints.
+    /// Build from `LarkConfig`, using the `platform` field for endpoint routing.
     pub fn from_config(config: &crate::config::schema::LarkConfig) -> Self {
-        let platform = if config.use_feishu {
-            LarkPlatform::Feishu
-        } else {
-            LarkPlatform::Lark
-        };
         let mut ch = Self::new_with_platform(
             config.app_id.clone(),
             config.app_secret.clone(),
@@ -365,7 +355,7 @@ impl LarkChannel {
             config.port,
             config.allowed_users.clone(),
             config.mention_only,
-            platform,
+            config.platform,
         );
         ch.receive_mode = config.receive_mode.clone();
         ch
@@ -2032,7 +2022,7 @@ mod tests {
             verification_token: Some("vtoken789".into()),
             allowed_users: vec!["ou_user1".into(), "ou_user2".into()],
             mention_only: false,
-            use_feishu: false,
+            platform: LarkPlatform::Lark,
             receive_mode: LarkReceiveMode::default(),
             port: None,
         };
@@ -2054,7 +2044,7 @@ mod tests {
             verification_token: Some("tok".into()),
             allowed_users: vec!["*".into()],
             mention_only: false,
-            use_feishu: false,
+            platform: LarkPlatform::Lark,
             receive_mode: LarkReceiveMode::Webhook,
             port: Some(9898),
         };
@@ -2088,7 +2078,7 @@ mod tests {
             verification_token: Some("vtoken789".into()),
             allowed_users: vec!["*".into()],
             mention_only: false,
-            use_feishu: false,
+            platform: LarkPlatform::Lark,
             receive_mode: LarkReceiveMode::Webhook,
             port: Some(9898),
         };
@@ -2112,7 +2102,7 @@ mod tests {
             verification_token: Some("vtoken789".into()),
             allowed_users: vec!["*".into()],
             mention_only: false,
-            use_feishu: true,
+            platform: LarkPlatform::Feishu,
             receive_mode: LarkReceiveMode::Webhook,
             port: Some(9898),
         };

@@ -3482,7 +3482,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                 ),
                 ChannelMenuChoice::Lark => format!(
                     "Lark       {}",
-                    if config.lark.as_ref().is_some_and(|cfg| !cfg.use_feishu) {
+                    if config.lark.as_ref().is_some_and(|cfg| cfg.platform != crate::config::schema::LarkPlatform::Feishu) {
                         "✅ connected"
                     } else {
                         "— Lark Bot"
@@ -3491,7 +3491,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                 ChannelMenuChoice::Feishu => format!(
                     "Feishu     {}",
                     if config.feishu.is_some()
-                        || config.lark.as_ref().is_some_and(|cfg| cfg.use_feishu)
+                        || config.lark.as_ref().is_some_and(|cfg| cfg.platform == crate::config::schema::LarkPlatform::Feishu)
                     {
                         "✅ connected"
                     } else {
@@ -4938,7 +4938,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     encrypt_key: None,
                     allowed_users,
                     mention_only: false,
-                    use_feishu: is_feishu,
+                    platform: if is_feishu { crate::config::schema::LarkPlatform::Feishu } else { crate::config::schema::LarkPlatform::Lark },
                     receive_mode,
                     port,
                 });

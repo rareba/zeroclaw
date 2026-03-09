@@ -62,7 +62,7 @@ mod tests {
             verification_token: None,
             allowed_users: vec![],
             mention_only: false,
-            use_feishu: false,
+            platform: crate::config::schema::LarkPlatform::Lark,
             receive_mode: crate::config::schema::LarkReceiveMode::Websocket,
             port: None,
         };
