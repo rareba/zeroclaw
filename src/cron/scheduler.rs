@@ -65,6 +65,8 @@ async fn execute_job_with_retry(
     let retries = config.reliability.scheduler_retries;
     let mut backoff_ms = config.reliability.provider_backoff_ms.max(200);
 
+    let job_name = job.name.as_deref().unwrap_or(&job.id);
+
     for attempt in 0..=retries {
         let (success, output) = match job.job_type {
             JobType::Shell => run_job_command(config, security, job).await,
@@ -73,21 +75,47 @@ async fn execute_job_with_retry(
         last_output = output;
 
         if success {
+            if attempt > 0 {
+                tracing::info!(
+                    job = %job_name,
+                    attempt = attempt + 1,
+                    "cron job succeeded after retry"
+                );
+            }
             return (true, last_output);
         }
 
         if last_output.starts_with("blocked by security policy:") {
-            // Deterministic policy violations are not retryable.
+            tracing::warn!(
+                job = %job_name,
+                error = %last_output,
+                "cron job blocked by security policy (not retryable)"
+            );
             return (false, last_output);
         }
 
         if attempt < retries {
             let jitter_ms = u64::from(Utc::now().timestamp_subsec_millis() % 250);
-            time::sleep(Duration::from_millis(backoff_ms + jitter_ms)).await;
+            let delay_ms = backoff_ms + jitter_ms;
+            tracing::warn!(
+                job = %job_name,
+                attempt = attempt + 1,
+                max_attempts = retries + 1,
+                next_retry_ms = delay_ms,
+                error = %last_output,
+                "cron job failed, retrying"
+            );
+            time::sleep(Duration::from_millis(delay_ms)).await;
             backoff_ms = (backoff_ms.saturating_mul(2)).min(30_000);
         }
     }
 
+    tracing::error!(
+        job = %job_name,
+        attempts = retries + 1,
+        error = %last_output,
+        "cron job failed after all retries"
+    );
     (false, last_output)
 }
 

@@ -232,7 +232,9 @@ pub async fn handle_api_cron_list(
                         "next_run": job.next_run.to_rfc3339(),
                         "last_run": job.last_run.map(|t| t.to_rfc3339()),
                         "last_status": job.last_status,
+                        "last_output": job.last_output,
                         "enabled": job.enabled,
+                        "schedule": job.schedule,
                     })
                 })
                 .collect();
