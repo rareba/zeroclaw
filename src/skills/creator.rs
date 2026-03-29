@@ -17,6 +17,24 @@ pub struct ToolCallRecord {
     pub args: serde_json::Value,
 }
 
+/// Tool names that represent internal/transient operations and should not
+/// appear in auto-generated skill definitions.  These tools interact with
+/// the agent's own runtime state rather than performing user-visible work.
+const EXCLUDED_TOOL_NAMES: &[&str] = &[
+    "memory_store",
+    "memory_recall",
+    "memory_forget",
+    "memorystore",
+    "memoryrecall",
+    "memoryforget",
+    "memstore",
+    "memrecall",
+    "memforget",
+    "store",
+    "recall",
+    "forget",
+];
+
 /// Creates reusable skill definitions from successful multi-step executions.
 pub struct SkillCreator {
     workspace_dir: PathBuf,
@@ -33,7 +51,7 @@ impl SkillCreator {
 
     /// Attempt to create a skill from a successful multi-step task execution.
     /// Returns `Ok(Some(slug))` if a skill was created, `Ok(None)` if skipped
-    /// (disabled, duplicate, or insufficient tool calls).
+    /// (disabled, duplicate, insufficient tool calls, or quality check failed).
     pub async fn create_from_execution(
         &self,
         task_description: &str,
@@ -44,24 +62,48 @@ impl SkillCreator {
             return Ok(None);
         }
 
-        if tool_calls.len() < 2 {
+        // Filter out internal/memory tools before checking the threshold.
+        let actionable_calls: Vec<_> = tool_calls
+            .iter()
+            .filter(|c| !is_excluded_tool(&c.name))
+            .filter(|c| {
+                c.args
+                    .get("command")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|s| !s.is_empty())
+            })
+            .cloned()
+            .collect();
+
+        if actionable_calls.len() < 2 {
             return Ok(None);
         }
 
+        // Strip memory context from description for slug generation and dedup.
+        let clean_description = strip_memory_context(task_description);
+
         // Deduplicate via embeddings when an embedding provider is available.
         if let Some(provider) = embedding_provider {
-            if provider.name() != "none" && self.is_duplicate(task_description, provider).await? {
+            if provider.name() != "none" && self.is_duplicate(&clean_description, provider).await? {
                 return Ok(None);
             }
         }
 
-        let slug = Self::generate_slug(task_description);
+        let slug = Self::generate_slug(&clean_description);
         if !Self::validate_slug(&slug) {
             return Ok(None);
         }
 
         // Enforce LRU limit before writing a new skill.
         self.enforce_lru_limit().await?;
+
+        let toml_content = Self::generate_skill_toml(&slug, &clean_description, &actionable_calls);
+
+        // Validate the generated TOML parses correctly and contains at
+        // least one tool definition before persisting to disk.
+        if !Self::validate_skill_toml(&toml_content) {
+            return Ok(None);
+        }
 
         let skill_dir = self.skills_dir().join(&slug);
         tokio::fs::create_dir_all(&skill_dir)
@@ -70,7 +112,6 @@ impl SkillCreator {
                 format!("Failed to create skill directory: {}", skill_dir.display())
             })?;
 
-        let toml_content = Self::generate_skill_toml(&slug, task_description, tool_calls);
         let toml_path = skill_dir.join("SKILL.toml");
         tokio::fs::write(&toml_path, toml_content.as_bytes())
             .await
@@ -130,21 +171,46 @@ impl SkillCreator {
     }
 
     /// Generate SKILL.toml content from task execution data.
+    ///
+    /// Only shell tool calls (those with a `command` argument) produce
+    /// `[[tools]]` entries.  Non-shell tools and internal/memory tools
+    /// are excluded so that the generated SKILL.toml contains only
+    /// actionable, well-formed tool definitions.
     fn generate_skill_toml(slug: &str, description: &str, tool_calls: &[ToolCallRecord]) -> String {
         use std::fmt::Write;
+
+        // Strip any memory-context prefix that was injected into the
+        // description by the agent loop.
+        let clean_desc = strip_memory_context(description);
+
         let mut toml = String::new();
         toml.push_str("[skill]\n");
         let _ = writeln!(toml, "name = {}", toml_escape(slug));
         let _ = writeln!(
             toml,
             "description = {}",
-            toml_escape(&format!("Auto-generated: {description}"))
+            toml_escape(&format!("Auto-generated: {clean_desc}"))
         );
         toml.push_str("version = \"0.1.0\"\n");
         toml.push_str("author = \"zeroclaw-auto\"\n");
         toml.push_str("tags = [\"auto-generated\"]\n");
 
         for call in tool_calls {
+            // Skip internal/memory tools — they are runtime-only and
+            // do not make sense as reusable skill steps.
+            if is_excluded_tool(&call.name) {
+                continue;
+            }
+
+            // Only emit a tool entry when we can determine a concrete
+            // shell command.  Tools without a "command" argument are
+            // non-shell (e.g. file_read, http) and cannot be
+            // meaningfully represented as `kind = "shell"`.
+            let command = match call.args.get("command").and_then(serde_json::Value::as_str) {
+                Some(cmd) if !cmd.is_empty() => cmd,
+                _ => continue,
+            };
+
             toml.push('\n');
             toml.push_str("[[tools]]\n");
             let _ = writeln!(toml, "name = {}", toml_escape(&call.name));
@@ -154,13 +220,6 @@ impl SkillCreator {
                 toml_escape(&format!("Tool used in task: {}", call.name))
             );
             toml.push_str("kind = \"shell\"\n");
-
-            // Extract the command from args if available, otherwise use the tool name.
-            let command = call
-                .args
-                .get("command")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or(&call.name);
             let _ = writeln!(toml, "command = {}", toml_escape(command));
         }
 
@@ -252,9 +311,129 @@ impl SkillCreator {
         Ok(())
     }
 
+    /// Validate that a SKILL.toml string is well-formed:
+    /// - Parses as valid TOML
+    /// - Contains a `[skill]` section with `name` and `description`
+    /// - Contains at least one `[[tools]]` entry with `name`, `kind`, and `command`
+    fn validate_skill_toml(content: &str) -> bool {
+        let parsed: toml::Value = match toml::from_str(content) {
+            Ok(v) => v,
+            Err(_) => return false,
+        };
+
+        // Must have a [skill] table with name + description.
+        let skill = match parsed.get("skill") {
+            Some(s) => s,
+            None => return false,
+        };
+        if skill.get("name").and_then(toml::Value::as_str).is_none() {
+            return false;
+        }
+        if skill
+            .get("description")
+            .and_then(toml::Value::as_str)
+            .is_none()
+        {
+            return false;
+        }
+
+        // Must have at least one [[tools]] entry.
+        let tools = match parsed.get("tools").and_then(toml::Value::as_array) {
+            Some(arr) if !arr.is_empty() => arr,
+            _ => return false,
+        };
+
+        // Each tool must have name, kind, and a non-empty command.
+        for tool in tools {
+            if tool.get("name").and_then(toml::Value::as_str).is_none() {
+                return false;
+            }
+            if tool.get("kind").and_then(toml::Value::as_str).is_none() {
+                return false;
+            }
+            match tool.get("command").and_then(toml::Value::as_str) {
+                Some(cmd) if !cmd.is_empty() => {}
+                _ => return false,
+            }
+        }
+
+        true
+    }
+
     fn skills_dir(&self) -> PathBuf {
         self.workspace_dir.join("skills")
     }
+}
+
+/// Check whether a tool name is internal/transient and should be excluded
+/// from auto-generated skill definitions.
+fn is_excluded_tool(name: &str) -> bool {
+    let lower = name.to_lowercase();
+    EXCLUDED_TOOL_NAMES
+        .iter()
+        .any(|&excluded| lower == excluded)
+}
+
+/// Strip `[Memory context] ... [/Memory context]` blocks that may have been
+/// prepended to user messages by the agent loop's RAG injection.
+fn strip_memory_context(s: &str) -> String {
+    let mut result = s.to_string();
+
+    // Remove `[Memory context]\n...\n[/Memory context]\n\n` blocks.
+    while let Some(start) = result.find("[Memory context]") {
+        if let Some(end) = result.find("[/Memory context]") {
+            let block_end = end + "[/Memory context]".len();
+            // Also consume trailing newlines after the closing tag.
+            let trailing = result[block_end..]
+                .chars()
+                .take_while(|c| *c == '\n' || *c == '\r')
+                .count();
+            result.replace_range(start..block_end + trailing, "");
+        } else {
+            // Malformed: opening tag without closing — strip to end of line.
+            if let Some(eol) = result[start..].find('\n') {
+                result.replace_range(start..=start + eol, "");
+            } else {
+                result.truncate(start);
+            }
+        }
+    }
+
+    // Remove `[Hardware documentation] ... [/Hardware documentation]` blocks too.
+    while let Some(start) = result.find("[Hardware documentation]") {
+        if let Some(end) = result.find("[/Hardware documentation]") {
+            let block_end = end + "[/Hardware documentation]".len();
+            let trailing = result[block_end..]
+                .chars()
+                .take_while(|c| *c == '\n' || *c == '\r')
+                .count();
+            result.replace_range(start..block_end + trailing, "");
+        } else if let Some(eol) = result[start..].find('\n') {
+            result.replace_range(start..=start + eol, "");
+        } else {
+            result.truncate(start);
+        }
+    }
+
+    // Strip leading timestamp prefix like `[2026-03-29 08:15:00 CET] `.
+    let trimmed = result.trim_start();
+    if trimmed.starts_with('[') {
+        if let Some(close) = trimmed.find("] ") {
+            let bracket_content = &trimmed[1..close];
+            // Only strip if it looks like a date/time (contains digits and dashes).
+            if bracket_content.len() >= 10
+                && bracket_content
+                    .chars()
+                    .filter(|c| c.is_ascii_digit())
+                    .count()
+                    >= 8
+            {
+                result = trimmed[close + 2..].to_string();
+            }
+        }
+    }
+
+    result.trim().to_string()
 }
 
 /// Escape a string for TOML value (double-quoted).
@@ -286,7 +465,8 @@ fn extract_description_from_toml(content: &str) -> Option<String> {
 /// Extract `ToolCallRecord`s from the agent conversation history.
 ///
 /// Scans assistant messages for tool call patterns (both JSON and XML formats)
-/// and returns records for each unique tool invocation.
+/// and returns records for each unique tool invocation.  Internal/memory
+/// tools are filtered out so callers receive only actionable tool calls.
 pub fn extract_tool_calls_from_history(
     history: &[crate::providers::ChatMessage],
 ) -> Vec<ToolCallRecord> {
@@ -312,7 +492,7 @@ pub fn extract_tool_calls_from_history(
                             .and_then(serde_json::Value::as_str)
                             .unwrap_or("{}");
                         let args = serde_json::from_str(args_str).unwrap_or_default();
-                        if !name.is_empty() {
+                        if !name.is_empty() && !is_excluded_tool(&name) {
                             records.push(ToolCallRecord { name, args });
                         }
                     }
@@ -340,12 +520,14 @@ pub fn extract_tool_calls_from_history(
                         let inner = &content[abs_start + end + 1..abs_start + end + 1 + close_pos];
                         let args: serde_json::Value =
                             serde_json::from_str(inner.trim()).unwrap_or_default();
-                        // Only add if it looks like a tool call (not HTML/formatting tags).
+                        // Only add if it looks like a tool call (not HTML/formatting
+                        // tags) and is not an internal/memory tool.
                         if tag_name != "tool_result"
                             && tag_name != "tool_results"
                             && !tag_name.contains(':')
                             && args.is_object()
                             && !args.as_object().map_or(true, |o| o.is_empty())
+                            && !is_excluded_tool(tag_name)
                         {
                             records.push(ToolCallRecord {
                                 name: tag_name.to_string(),
@@ -512,18 +694,37 @@ mod tests {
     }
 
     #[test]
-    fn toml_generation_no_command_arg() {
+    fn toml_generation_skips_no_command_arg() {
         let calls = vec![ToolCallRecord {
-            name: "memory_store".into(),
-            args: serde_json::json!({"key": "foo", "value": "bar"}),
+            name: "file_read".into(),
+            args: serde_json::json!({"path": "/tmp/foo.txt"}),
         }];
-        let toml_str = SkillCreator::generate_skill_toml("memory-op", "Store to memory", &calls);
+        let toml_str = SkillCreator::generate_skill_toml("file-op", "Read a file", &calls);
+        let parsed: toml::Value = toml::from_str(&toml_str).expect("TOML should be valid");
+        // Tools without a "command" argument are now skipped entirely.
+        assert!(parsed.get("tools").is_none());
+    }
+
+    #[test]
+    fn toml_generation_skips_memory_tools() {
+        let calls = vec![
+            ToolCallRecord {
+                name: "memory_store".into(),
+                args: serde_json::json!({"command": "memory_store --key foo"}),
+            },
+            ToolCallRecord {
+                name: "shell".into(),
+                args: serde_json::json!({"command": "echo hello"}),
+            },
+        ];
+        let toml_str = SkillCreator::generate_skill_toml("mixed-op", "Mixed tools", &calls);
         let parsed: toml::Value = toml::from_str(&toml_str).expect("TOML should be valid");
         let tools = parsed.get("tools").and_then(toml::Value::as_array).unwrap();
-        // When no "command" arg exists, falls back to tool name.
+        // Only the shell tool should be present; memory_store is excluded.
+        assert_eq!(tools.len(), 1);
         assert_eq!(
             tools[0].get("command").and_then(toml::Value::as_str),
-            Some("memory_store")
+            Some("echo hello")
         );
     }
 
@@ -879,8 +1080,8 @@ tags = ["auto-generated"]
             &"long ".repeat(100),
         ];
 
+        // Only args with a "command" key produce tool entries now.
         let args_variants = [
-            serde_json::json!({}),
             serde_json::json!({"command": "echo hello"}),
             serde_json::json!({"command": "echo \"hello world\"", "extra": 42}),
         ];
@@ -903,5 +1104,215 @@ tags = ["auto-generated"]
                     .unwrap_or_else(|e| panic!("Invalid TOML for desc '{desc}': {e}\n{toml_str}"));
             }
         }
+    }
+
+    // ── Memory context stripping ────────────────────────────────
+
+    #[test]
+    fn strip_memory_context_removes_block() {
+        let input = "[Memory context]\n- key: value\n[/Memory context]\n\nDeploy the app";
+        assert_eq!(strip_memory_context(input), "Deploy the app");
+    }
+
+    #[test]
+    fn strip_memory_context_removes_multiple_blocks() {
+        let input = "[Memory context]\n- a: b\n[/Memory context]\n\n\
+                      [Hardware documentation]\n- x\n[/Hardware documentation]\n\nDo the thing";
+        assert_eq!(strip_memory_context(input), "Do the thing");
+    }
+
+    #[test]
+    fn strip_memory_context_strips_timestamp() {
+        let input = "[2026-03-29 08:15:00 CET] Deploy the app";
+        assert_eq!(strip_memory_context(input), "Deploy the app");
+    }
+
+    #[test]
+    fn strip_memory_context_full_enriched_message() {
+        let input = "[Memory context]\n- pref: dark mode\n- lang: en\n\
+                      [/Memory context]\n\n[2026-03-29 10:00:00 UTC] Build and test the project";
+        assert_eq!(strip_memory_context(input), "Build and test the project");
+    }
+
+    #[test]
+    fn strip_memory_context_no_context() {
+        let input = "Just a plain message";
+        assert_eq!(strip_memory_context(input), "Just a plain message");
+    }
+
+    // ── Excluded tool filtering ─────────────────────────────────
+
+    #[test]
+    fn is_excluded_tool_matches() {
+        assert!(is_excluded_tool("memory_store"));
+        assert!(is_excluded_tool("memory_recall"));
+        assert!(is_excluded_tool("memory_forget"));
+        assert!(is_excluded_tool("MEMORY_STORE"));
+        assert!(is_excluded_tool("MemoryRecall"));
+    }
+
+    #[test]
+    fn is_excluded_tool_allows_normal() {
+        assert!(!is_excluded_tool("shell"));
+        assert!(!is_excluded_tool("file_read"));
+        assert!(!is_excluded_tool("http_request"));
+    }
+
+    // ── TOML validation ─────────────────────────────────────────
+
+    #[test]
+    fn validate_skill_toml_valid() {
+        let content = r#"
+[skill]
+name = "test"
+description = "Auto-generated: Test"
+version = "0.1.0"
+author = "zeroclaw-auto"
+tags = ["auto-generated"]
+
+[[tools]]
+name = "shell"
+description = "Tool used in task: shell"
+kind = "shell"
+command = "echo hello"
+"#;
+        assert!(SkillCreator::validate_skill_toml(content));
+    }
+
+    #[test]
+    fn validate_skill_toml_missing_tools() {
+        let content = r#"
+[skill]
+name = "test"
+description = "Auto-generated: Test"
+version = "0.1.0"
+"#;
+        assert!(!SkillCreator::validate_skill_toml(content));
+    }
+
+    #[test]
+    fn validate_skill_toml_empty_command() {
+        let content = r#"
+[skill]
+name = "test"
+description = "Auto-generated: Test"
+version = "0.1.0"
+
+[[tools]]
+name = "shell"
+description = "Tool"
+kind = "shell"
+command = ""
+"#;
+        assert!(!SkillCreator::validate_skill_toml(content));
+    }
+
+    #[test]
+    fn validate_skill_toml_invalid_toml() {
+        assert!(!SkillCreator::validate_skill_toml("not valid {{"));
+    }
+
+    // ── End-to-end: memory tools filtered in create_from_execution ──
+
+    #[tokio::test]
+    async fn create_from_execution_skips_memory_only_calls() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = SkillCreationConfig {
+            enabled: true,
+            max_skills: 500,
+            similarity_threshold: 0.85,
+        };
+        let creator = SkillCreator::new(dir.path().to_path_buf(), config);
+
+        // All calls are memory tools — should be filtered and result in None.
+        let calls = vec![
+            ToolCallRecord {
+                name: "memory_store".into(),
+                args: serde_json::json!({"key": "foo", "value": "bar"}),
+            },
+            ToolCallRecord {
+                name: "memory_recall".into(),
+                args: serde_json::json!({"query": "preferences"}),
+            },
+        ];
+
+        let noop = NoopEmbedding;
+        let result = creator
+            .create_from_execution("Remember things", &calls, Some(&noop))
+            .await
+            .unwrap();
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn create_from_execution_filters_enriched_description() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = SkillCreationConfig {
+            enabled: true,
+            max_skills: 500,
+            similarity_threshold: 0.85,
+        };
+        let creator = SkillCreator::new(dir.path().to_path_buf(), config);
+
+        let calls = vec![
+            ToolCallRecord {
+                name: "shell".into(),
+                args: serde_json::json!({"command": "cargo build"}),
+            },
+            ToolCallRecord {
+                name: "shell".into(),
+                args: serde_json::json!({"command": "cargo test"}),
+            },
+        ];
+
+        // Task description with memory context prefix — should be stripped.
+        let enriched = "[Memory context]\n- pref: dark\n[/Memory context]\n\n\
+                        [2026-03-29 10:00:00 UTC] Build and test";
+        let noop = NoopEmbedding;
+        let result = creator
+            .create_from_execution(enriched, &calls, Some(&noop))
+            .await
+            .unwrap();
+        assert_eq!(result, Some("build-and-test".into()));
+
+        // Verify the TOML description does not contain memory context.
+        let toml_content = tokio::fs::read_to_string(
+            dir.path()
+                .join("skills")
+                .join("build-and-test")
+                .join("SKILL.toml"),
+        )
+        .await
+        .unwrap();
+        assert!(!toml_content.contains("[Memory context]"));
+        assert!(toml_content.contains("Build and test"));
+    }
+
+    // ── Extract tool calls filters memory tools ─────────────────
+
+    #[test]
+    fn extract_tool_calls_filters_memory_json() {
+        use crate::providers::ChatMessage;
+        let history = vec![ChatMessage::assistant(
+            r#"{"tool_calls": [
+                {"type": "function", "function": {"name": "memory_recall", "arguments": "{}"}},
+                {"type": "function", "function": {"name": "shell", "arguments": "{\"command\": \"ls\"}"}}
+            ]}"#,
+        )];
+        let records = extract_tool_calls_from_history(&history);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].name, "shell");
+    }
+
+    #[test]
+    fn extract_tool_calls_filters_memory_xml() {
+        use crate::providers::ChatMessage;
+        let history = vec![ChatMessage::assistant(
+            "<memory_store>{\"key\":\"foo\",\"value\":\"bar\"}</memory_store>\n\
+             <shell>{\"command\":\"echo hello\"}</shell>",
+        )];
+        let records = extract_tool_calls_from_history(&history);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].name, "shell");
     }
 }
