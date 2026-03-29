@@ -47,7 +47,10 @@ pub fn create_sandbox(config: &SecurityConfig) -> Arc<dyn Sandbox> {
             {
                 #[cfg(any(target_os = "linux", target_os = "macos"))]
                 {
-                    if let Ok(sandbox) = super::bubblewrap::BubblewrapSandbox::new() {
+                    if let Ok(sandbox) = super::bubblewrap::BubblewrapSandbox::with_config(
+                        config.sandbox.writable_paths.clone(),
+                        config.sandbox.allow_network,
+                    ) {
                         return Arc::new(sandbox);
                     }
                 }
@@ -62,6 +65,18 @@ pub fn create_sandbox(config: &SecurityConfig) -> Arc<dyn Sandbox> {
                 return Arc::new(sandbox);
             }
             tracing::warn!("Docker requested but not available, falling back to application-layer");
+            Arc::new(super::traits::NoopSandbox)
+        }
+        SandboxBackend::SandboxExec => {
+            #[cfg(target_os = "macos")]
+            {
+                if let Ok(sandbox) = super::seatbelt::SeatbeltSandbox::new() {
+                    return Arc::new(sandbox);
+                }
+            }
+            tracing::warn!(
+                "sandbox-exec requested but not available, falling back to application-layer"
+            );
             Arc::new(super::traits::NoopSandbox)
         }
         SandboxBackend::Auto | SandboxBackend::None => {
@@ -101,6 +116,12 @@ fn detect_best_sandbox() -> Arc<dyn Sandbox> {
                 return Arc::new(sandbox);
             }
         }
+
+        // Try sandbox-exec (Seatbelt) — built into macOS
+        if let Ok(sandbox) = super::seatbelt::SeatbeltSandbox::probe() {
+            tracing::info!("macOS sandbox-exec (Seatbelt) enabled");
+            return Arc::new(sandbox);
+        }
     }
 
     // Docker is heavy but works everywhere if docker is installed
@@ -133,6 +154,8 @@ mod tests {
                 enabled: Some(false),
                 backend: SandboxBackend::None,
                 firejail_args: Vec::new(),
+                writable_paths: Vec::new(),
+                allow_network: false,
             },
             ..Default::default()
         };
@@ -147,6 +170,8 @@ mod tests {
                 enabled: None, // Auto-detect
                 backend: SandboxBackend::Auto,
                 firejail_args: Vec::new(),
+                writable_paths: Vec::new(),
+                allow_network: false,
             },
             ..Default::default()
         };
