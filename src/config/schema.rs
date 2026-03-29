@@ -7586,6 +7586,20 @@ pub struct SandboxConfig {
     /// Custom Firejail arguments (when backend = firejail)
     #[serde(default)]
     pub firejail_args: Vec<String>,
+
+    /// Additional paths to bind-mount as writable inside the sandbox.
+    /// Each path must be absolute and must not contain path-traversal components
+    /// (`..`). Applies to backends that support writable bind mounts (e.g.,
+    /// bubblewrap). Defaults to empty (only `/tmp` is writable).
+    #[serde(default)]
+    pub writable_paths: Vec<String>,
+
+    /// Allow network access inside the sandbox. When `false` (the default),
+    /// network namespaces are unshared so sandboxed processes cannot reach the
+    /// network. Set to `true` only when the sandboxed command genuinely needs
+    /// connectivity (e.g., package installation).
+    #[serde(default)]
+    pub allow_network: bool,
 }
 
 impl Default for SandboxConfig {
@@ -7594,6 +7608,8 @@ impl Default for SandboxConfig {
             enabled: None, // Auto-detect
             backend: SandboxBackend::Auto,
             firejail_args: Vec::new(),
+            writable_paths: Vec::new(),
+            allow_network: false,
         }
     }
 }
