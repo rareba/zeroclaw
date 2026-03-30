@@ -669,6 +669,11 @@ pub struct DelegateAgentConfig {
     /// preventing cross-contamination with memory from other agents.
     #[serde(default)]
     pub memory_namespace: Option<String>,
+    /// Optional list of skill names to auto-load into the sub-agent's system prompt.
+    /// When set, the named skills are loaded and their prompts are injected into
+    /// the sub-agent's context regardless of the skills directory contents.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pinned_skills: Option<Vec<String>>,
 }
 
 fn default_delegate_timeout_secs() -> u64 {
@@ -12020,6 +12025,7 @@ default_temperature = 0.7
                 agentic_timeout_secs: None,
                 skills_directory: None,
                 memory_namespace: None,
+                pinned_skills: None,
             },
         );
 

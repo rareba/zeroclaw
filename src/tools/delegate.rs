@@ -1026,7 +1026,14 @@ impl DelegateTool {
             .filter(|s| !s.trim().is_empty())
             .map(|dir| workspace_dir.join(dir))
             .unwrap_or_else(|| crate::skills::skills_dir(workspace_dir));
-        let skills = crate::skills::load_skills_from_directory(&skills_dir, false);
+        let mut skills = crate::skills::load_skills_from_directory(&skills_dir, false);
+
+        // When pinned_skills is configured, filter to only the pinned skill names.
+        if let Some(pinned) = &agent_config.pinned_skills {
+            if !pinned.is_empty() {
+                skills.retain(|s| pinned.iter().any(|p| p == &s.name));
+            }
+        }
 
         // Determine shell policy instructions when the `shell` tool is in the
         // effective tool list.
@@ -1287,6 +1294,7 @@ mod tests {
                 agentic_timeout_secs: None,
                 skills_directory: None,
                 memory_namespace: None,
+                pinned_skills: None,
             },
         );
         agents.insert(
@@ -1305,6 +1313,7 @@ mod tests {
                 agentic_timeout_secs: None,
                 skills_directory: None,
                 memory_namespace: None,
+                pinned_skills: None,
             },
         );
         agents
@@ -1462,6 +1471,7 @@ mod tests {
             agentic_timeout_secs: None,
             skills_directory: None,
             memory_namespace: None,
+            pinned_skills: None,
         }
     }
 
@@ -1578,6 +1588,7 @@ mod tests {
                 agentic_timeout_secs: None,
                 skills_directory: None,
                 memory_namespace: None,
+                pinned_skills: None,
             },
         );
         let tool = DelegateTool::new(agents, None, test_security());
@@ -1692,6 +1703,7 @@ mod tests {
                 agentic_timeout_secs: None,
                 skills_directory: None,
                 memory_namespace: None,
+                pinned_skills: None,
             },
         );
         let tool = DelegateTool::new(agents, None, test_security());
@@ -1733,6 +1745,7 @@ mod tests {
                 agentic_timeout_secs: None,
                 skills_directory: None,
                 memory_namespace: None,
+                pinned_skills: None,
             },
         );
         let tool = DelegateTool::new(agents, None, test_security());
@@ -2022,6 +2035,7 @@ mod tests {
             agentic_timeout_secs: None,
             skills_directory: None,
             memory_namespace: None,
+            pinned_skills: None,
         };
 
         let tools: Vec<Box<dyn Tool>> = vec![Box::new(EchoTool)];
@@ -2076,6 +2090,7 @@ mod tests {
             agentic_timeout_secs: None,
             skills_directory: None,
             memory_namespace: None,
+            pinned_skills: None,
         };
 
         struct MockShellTool;
@@ -2147,6 +2162,7 @@ mod tests {
             agentic_timeout_secs: None,
             skills_directory: None,
             memory_namespace: None,
+            pinned_skills: None,
         };
         assert_eq!(
             config.timeout_secs.unwrap_or(DEFAULT_DELEGATE_TIMEOUT_SECS),
@@ -2176,6 +2192,7 @@ mod tests {
             agentic_timeout_secs: None,
             skills_directory: None,
             memory_namespace: None,
+            pinned_skills: None,
         };
 
         let tools: Vec<Box<dyn Tool>> = vec![Box::new(EchoTool)];
@@ -2210,6 +2227,7 @@ mod tests {
             agentic_timeout_secs: Some(600),
             skills_directory: None,
             memory_namespace: None,
+            pinned_skills: None,
         };
         assert_eq!(
             config.timeout_secs.unwrap_or(DEFAULT_DELEGATE_TIMEOUT_SECS),
@@ -2266,6 +2284,7 @@ mod tests {
                 agentic_timeout_secs: None,
                 skills_directory: None,
                 memory_namespace: None,
+                pinned_skills: None,
             },
         );
         let err = config.validate().unwrap_err();
@@ -2294,6 +2313,7 @@ mod tests {
                 agentic_timeout_secs: Some(0),
                 skills_directory: None,
                 memory_namespace: None,
+                pinned_skills: None,
             },
         );
         let err = config.validate().unwrap_err();
@@ -2322,6 +2342,7 @@ mod tests {
                 agentic_timeout_secs: None,
                 skills_directory: None,
                 memory_namespace: None,
+                pinned_skills: None,
             },
         );
         let err = config.validate().unwrap_err();
@@ -2350,6 +2371,7 @@ mod tests {
                 agentic_timeout_secs: Some(5000),
                 skills_directory: None,
                 memory_namespace: None,
+                pinned_skills: None,
             },
         );
         let err = config.validate().unwrap_err();
@@ -2378,6 +2400,7 @@ mod tests {
                 agentic_timeout_secs: Some(3600),
                 skills_directory: None,
                 memory_namespace: None,
+                pinned_skills: None,
             },
         );
         assert!(config.validate().is_ok());
@@ -2402,6 +2425,7 @@ mod tests {
                 agentic_timeout_secs: None,
                 skills_directory: None,
                 memory_namespace: None,
+                pinned_skills: None,
             },
         );
         assert!(config.validate().is_ok());
@@ -2435,6 +2459,7 @@ mod tests {
             agentic_timeout_secs: None,
             skills_directory: Some("skills/code-review".to_string()),
             memory_namespace: None,
+            pinned_skills: None,
         };
 
         let tools: Vec<Box<dyn Tool>> = vec![Box::new(EchoTool)];
@@ -2482,6 +2507,7 @@ mod tests {
             agentic_timeout_secs: None,
             skills_directory: None,
             memory_namespace: None,
+            pinned_skills: None,
         };
 
         let tools: Vec<Box<dyn Tool>> = vec![Box::new(EchoTool)];
@@ -2935,6 +2961,160 @@ mod tests {
 
         assert!(!result.success);
         assert!(result.error.unwrap().contains("Invalid task_id"));
+
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    // ── Pinned skills config parsing tests ────────────────────────────
+
+    #[test]
+    fn pinned_skills_deserialization_defaults_to_none() {
+        let toml_str = r#"
+            provider = "ollama"
+            model = "llama3"
+        "#;
+        let config: DelegateAgentConfig = toml::from_str(toml_str).unwrap();
+        assert!(config.pinned_skills.is_none());
+    }
+
+    #[test]
+    fn pinned_skills_deserialization_with_values() {
+        let toml_str = r#"
+            provider = "ollama"
+            model = "llama3"
+            pinned_skills = ["code-review", "deploy"]
+        "#;
+        let config: DelegateAgentConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(
+            config.pinned_skills,
+            Some(vec!["code-review".to_string(), "deploy".to_string()])
+        );
+    }
+
+    #[test]
+    fn pinned_skills_deserialization_empty_array() {
+        let toml_str = r#"
+            provider = "ollama"
+            model = "llama3"
+            pinned_skills = []
+        "#;
+        let config: DelegateAgentConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.pinned_skills, Some(vec![]));
+    }
+
+    #[test]
+    fn pinned_skills_filters_loaded_skills() {
+        let workspace = std::env::temp_dir().join(format!(
+            "zeroclaw_delegate_pinned_test_{}",
+            uuid::Uuid::new_v4()
+        ));
+        let skills_dir = workspace.join("skills");
+        // Create two skills: "lint-check" and "deploy"
+        std::fs::create_dir_all(skills_dir.join("lint-check")).unwrap();
+        std::fs::write(
+            skills_dir.join("lint-check/SKILL.toml"),
+            "[skill]\nname = \"lint-check\"\ndescription = \"Run lint checks\"\nversion = \"1.0.0\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(skills_dir.join("deploy")).unwrap();
+        std::fs::write(
+            skills_dir.join("deploy/SKILL.toml"),
+            "[skill]\nname = \"deploy\"\ndescription = \"Deploy safely\"\nversion = \"1.0.0\"\n",
+        )
+        .unwrap();
+
+        let config = DelegateAgentConfig {
+            provider: "openrouter".to_string(),
+            model: "test-model".to_string(),
+            system_prompt: None,
+            api_key: None,
+            temperature: None,
+            max_depth: 3,
+            agentic: true,
+            allowed_tools: vec!["echo_tool".to_string()],
+            max_iterations: 10,
+            timeout_secs: None,
+            agentic_timeout_secs: None,
+            skills_directory: None,
+            memory_namespace: None,
+            pinned_skills: Some(vec!["lint-check".to_string()]),
+        };
+
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(EchoTool)];
+
+        let tool = DelegateTool::new(HashMap::new(), None, test_security())
+            .with_workspace_dir(workspace.clone());
+
+        let prompt = tool
+            .build_enriched_system_prompt(&config, &tools, &workspace)
+            .unwrap();
+
+        assert!(
+            prompt.contains("lint-check"),
+            "should contain pinned skill 'lint-check'"
+        );
+        assert!(
+            !prompt.contains("deploy"),
+            "should NOT contain non-pinned skill 'deploy'"
+        );
+
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn pinned_skills_none_loads_all_skills() {
+        let workspace = std::env::temp_dir().join(format!(
+            "zeroclaw_delegate_pinned_none_test_{}",
+            uuid::Uuid::new_v4()
+        ));
+        let skills_dir = workspace.join("skills");
+        std::fs::create_dir_all(skills_dir.join("skill-a")).unwrap();
+        std::fs::write(
+            skills_dir.join("skill-a/SKILL.toml"),
+            "[skill]\nname = \"skill-a\"\ndescription = \"Skill A\"\nversion = \"1.0.0\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(skills_dir.join("skill-b")).unwrap();
+        std::fs::write(
+            skills_dir.join("skill-b/SKILL.toml"),
+            "[skill]\nname = \"skill-b\"\ndescription = \"Skill B\"\nversion = \"1.0.0\"\n",
+        )
+        .unwrap();
+
+        let config = DelegateAgentConfig {
+            provider: "openrouter".to_string(),
+            model: "test-model".to_string(),
+            system_prompt: None,
+            api_key: None,
+            temperature: None,
+            max_depth: 3,
+            agentic: true,
+            allowed_tools: vec!["echo_tool".to_string()],
+            max_iterations: 10,
+            timeout_secs: None,
+            agentic_timeout_secs: None,
+            skills_directory: None,
+            memory_namespace: None,
+            pinned_skills: None,
+        };
+
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(EchoTool)];
+
+        let tool = DelegateTool::new(HashMap::new(), None, test_security())
+            .with_workspace_dir(workspace.clone());
+
+        let prompt = tool
+            .build_enriched_system_prompt(&config, &tools, &workspace)
+            .unwrap();
+
+        assert!(
+            prompt.contains("skill-a"),
+            "should contain all skills when pinned_skills is None"
+        );
+        assert!(
+            prompt.contains("skill-b"),
+            "should contain all skills when pinned_skills is None"
+        );
 
         let _ = std::fs::remove_dir_all(workspace);
     }

@@ -273,6 +273,7 @@ impl ModelRoutingConfigTool {
                     "agentic": agent.agentic,
                     "allowed_tools": agent.allowed_tools,
                     "max_iterations": agent.max_iterations,
+                    "pinned_skills": agent.pinned_skills,
                 }),
             );
         }
@@ -689,6 +690,16 @@ impl ModelRoutingConfigTool {
             None
         };
 
+        let pinned_skills_update = if let Some(raw) = args.get("pinned_skills") {
+            if raw.is_null() {
+                Some(None) // explicit null clears pinned_skills
+            } else {
+                Some(Some(Self::parse_string_list(raw, "pinned_skills")?))
+            }
+        } else {
+            None
+        };
+
         let mut cfg = self.load_config_without_env()?;
 
         let mut next_agent = cfg
@@ -709,6 +720,7 @@ impl ModelRoutingConfigTool {
                 agentic_timeout_secs: None,
                 skills_directory: None,
                 memory_namespace: None,
+                pinned_skills: None,
             });
 
         next_agent.provider = provider;
@@ -755,6 +767,10 @@ impl ModelRoutingConfigTool {
 
         if let Some(allowed_tools) = allowed_tools_update {
             next_agent.allowed_tools = allowed_tools;
+        }
+
+        if let Some(pinned_skills) = pinned_skills_update {
+            next_agent.pinned_skills = pinned_skills;
         }
 
         if next_agent.max_depth == 0 {
@@ -918,6 +934,13 @@ impl Tool for ModelRoutingConfigTool {
                     "type": ["integer", "null"],
                     "minimum": 1,
                     "description": "Maximum tool-call iterations for agentic delegate mode"
+                },
+                "pinned_skills": {
+                    "description": "Skill names to auto-load into delegate agent prompt (string array or null to clear)",
+                    "oneOf": [
+                        {"type": "array", "items": {"type": "string"}},
+                        {"type": "null"}
+                    ]
                 }
             },
             "additionalProperties": false
