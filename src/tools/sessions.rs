@@ -1,9 +1,10 @@
 //! Session-to-session messaging tools for inter-agent communication.
 //!
-//! Provides three tools:
+//! Provides four tools:
 //! - `sessions_list` — list active sessions with metadata
 //! - `sessions_history` — read message history from a specific session
 //! - `sessions_send` — send a message to a specific session
+//! - `sessions_await` — wait for one or more sessions to complete (fan-in)
 
 use super::traits::{Tool, ToolResult};
 use crate::channels::session_backend::SessionBackend;
@@ -13,6 +14,7 @@ use async_trait::async_trait;
 use serde_json::json;
 use std::fmt::Write;
 use std::sync::Arc;
+use tokio::time::{Duration, Instant};
 
 /// Validate that a session ID is non-empty and contains at least one
 /// alphanumeric character (prevents blank keys after sanitization).
@@ -290,6 +292,291 @@ impl Tool for SessionsSendTool {
                 output: String::new(),
                 error: Some(format!("Failed to send message: {e}")),
             }),
+        }
+    }
+}
+
+// ── SessionsAwaitTool ──────────────────────────────────────────────
+
+/// Completion markers that signal a session has finished its work.
+const COMPLETION_MARKERS: &[&str] = &["[DONE]", "[COMPLETE]"];
+
+/// Default idle-timeout in seconds: a session with no new messages for this
+/// long is considered complete.
+const DEFAULT_IDLE_SECS: u64 = 30;
+
+/// Waits for one or more sessions to complete, then returns their final outputs.
+///
+/// A session is considered "complete" when:
+/// 1. Its last message contains a completion marker (`[DONE]` or `[COMPLETE]`), or
+/// 2. It has been idle (no new messages) for `idle_timeout_secs` (default 30s).
+///
+/// Supports two modes:
+/// - `"all"` (default): wait until every listed session is complete or the timeout expires.
+/// - `"any"`: return as soon as the first session completes.
+pub struct SessionsAwaitTool {
+    backend: Arc<dyn SessionBackend>,
+    security: Arc<SecurityPolicy>,
+}
+
+impl SessionsAwaitTool {
+    pub fn new(backend: Arc<dyn SessionBackend>, security: Arc<SecurityPolicy>) -> Self {
+        Self { backend, security }
+    }
+}
+
+/// Per-session tracking state used during the polling loop.
+struct SessionPollState {
+    id: String,
+    last_message_count: usize,
+    last_change: Instant,
+    completed: bool,
+}
+
+/// Check whether the last message in a session contains a completion marker.
+fn has_completion_marker(backend: &dyn SessionBackend, session_id: &str) -> bool {
+    let messages = backend.load(session_id);
+    messages.last().is_some_and(|msg| {
+        let content = msg.content.to_uppercase();
+        COMPLETION_MARKERS
+            .iter()
+            .any(|marker| content.contains(marker))
+    })
+}
+
+/// Build a human-readable summary of final messages for completed sessions.
+fn format_completed_sessions(
+    backend: &dyn SessionBackend,
+    states: &[SessionPollState],
+    timed_out: bool,
+) -> String {
+    let completed: Vec<_> = states.iter().filter(|s| s.completed).collect();
+    let pending: Vec<_> = states.iter().filter(|s| !s.completed).collect();
+
+    let mut output = String::new();
+
+    if timed_out {
+        let _ = writeln!(
+            output,
+            "Timeout reached. {}/{} session(s) completed.",
+            completed.len(),
+            states.len()
+        );
+    } else {
+        let _ = writeln!(output, "{} session(s) completed.", completed.len());
+    }
+
+    for state in &completed {
+        let messages = backend.load(&state.id);
+        let _ = writeln!(output, "\n--- {} ---", state.id);
+        // Show last 5 messages as final context
+        let start = messages.len().saturating_sub(5);
+        for msg in &messages[start..] {
+            let _ = writeln!(output, "[{}] {}", msg.role, msg.content);
+        }
+    }
+
+    if !pending.is_empty() {
+        let _ = write!(output, "\nPending sessions: ");
+        let ids: Vec<&str> = pending.iter().map(|s| s.id.as_str()).collect();
+        let _ = writeln!(output, "{}", ids.join(", "));
+    }
+
+    output
+}
+
+#[async_trait]
+impl Tool for SessionsAwaitTool {
+    fn name(&self) -> &str {
+        "sessions_await"
+    }
+
+    fn description(&self) -> &str {
+        "Wait for one or more sessions to complete, then return their final outputs."
+    }
+
+    fn parameters_schema(&self) -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "session_ids": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Session IDs to wait for"
+                },
+                "timeout_secs": {
+                    "type": "integer",
+                    "description": "Maximum wait time in seconds (default: 300)"
+                },
+                "mode": {
+                    "type": "string",
+                    "enum": ["all", "any"],
+                    "description": "Wait mode: 'all' waits for every session (default), 'any' returns when the first completes"
+                },
+                "idle_timeout_secs": {
+                    "type": "integer",
+                    "description": "Seconds of inactivity before a session is considered complete (default: 30)"
+                }
+            },
+            "required": ["session_ids"]
+        })
+    }
+
+    async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+        // Security check
+        if let Err(error) = self
+            .security
+            .enforce_tool_operation(ToolOperation::Read, "sessions_await")
+        {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(error),
+            });
+        }
+
+        // Parse session_ids
+        let session_ids: Vec<String> = args
+            .get("session_ids")
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| anyhow::anyhow!("Missing or invalid 'session_ids' parameter"))?
+            .iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect();
+
+        if session_ids.is_empty() {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some("'session_ids' must contain at least one session ID.".into()),
+            });
+        }
+
+        // Validate all session IDs
+        for id in &session_ids {
+            if let Err(result) = validate_session_id(id) {
+                return Ok(result);
+            }
+        }
+
+        let timeout_secs = args
+            .get("timeout_secs")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(300);
+
+        let idle_timeout_secs = args
+            .get("idle_timeout_secs")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(DEFAULT_IDLE_SECS);
+
+        let mode = args
+            .get("mode")
+            .and_then(|v| v.as_str())
+            .unwrap_or("all");
+
+        if mode != "all" && mode != "any" {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(format!(
+                    "Invalid mode '{mode}'. Must be 'all' or 'any'."
+                )),
+            });
+        }
+
+        let wait_all = mode == "all";
+        let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+        let idle_duration = Duration::from_secs(idle_timeout_secs);
+        let poll_interval = Duration::from_secs(2);
+
+        // Initialize per-session poll state
+        let now = Instant::now();
+        let mut states: Vec<SessionPollState> = session_ids
+            .iter()
+            .map(|id| {
+                let messages = self.backend.load(id);
+                SessionPollState {
+                    id: id.clone(),
+                    last_message_count: messages.len(),
+                    last_change: now,
+                    completed: false,
+                }
+            })
+            .collect();
+
+        // Check for already-completed sessions (completion marker present)
+        for state in &mut states {
+            if has_completion_marker(self.backend.as_ref(), &state.id) {
+                state.completed = true;
+            }
+        }
+
+        // Early return if condition already met
+        let done = if wait_all {
+            states.iter().all(|s| s.completed)
+        } else {
+            states.iter().any(|s| s.completed)
+        };
+
+        if done {
+            let output = format_completed_sessions(self.backend.as_ref(), &states, false);
+            return Ok(ToolResult {
+                success: true,
+                output,
+                error: None,
+            });
+        }
+
+        // Polling loop
+        loop {
+            tokio::time::sleep(poll_interval).await;
+
+            if Instant::now() >= deadline {
+                // Mark any idle-completed sessions before reporting timeout
+                let output = format_completed_sessions(self.backend.as_ref(), &states, true);
+                return Ok(ToolResult {
+                    success: true,
+                    output,
+                    error: None,
+                });
+            }
+
+            for state in &mut states {
+                if state.completed {
+                    continue;
+                }
+
+                // Check for completion marker first
+                if has_completion_marker(self.backend.as_ref(), &state.id) {
+                    state.completed = true;
+                    continue;
+                }
+
+                // Check for activity changes
+                let current_count = self.backend.load(&state.id).len();
+                if current_count != state.last_message_count {
+                    state.last_message_count = current_count;
+                    state.last_change = Instant::now();
+                } else if state.last_change.elapsed() >= idle_duration {
+                    // Idle timeout reached — consider complete
+                    state.completed = true;
+                }
+            }
+
+            let done = if wait_all {
+                states.iter().all(|s| s.completed)
+            } else {
+                states.iter().any(|s| s.completed)
+            };
+
+            if done {
+                let output = format_completed_sessions(self.backend.as_ref(), &states, false);
+                return Ok(ToolResult {
+                    success: true,
+                    output,
+                    error: None,
+                });
+            }
         }
     }
 }
@@ -575,5 +862,253 @@ mod tests {
                 .unwrap()
                 .contains(&json!("message"))
         );
+    }
+
+    // ── SessionsAwaitTool tests ────────────────────────────────────
+
+    #[test]
+    fn await_tool_name_and_schema() {
+        let (_tmp, backend) = test_backend();
+        let tool = SessionsAwaitTool::new(backend, test_security());
+        assert_eq!(tool.name(), "sessions_await");
+        let schema = tool.parameters_schema();
+        assert!(schema["properties"]["session_ids"].is_object());
+        assert!(schema["properties"]["timeout_secs"].is_object());
+        assert!(schema["properties"]["mode"].is_object());
+        assert!(
+            schema["required"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("session_ids"))
+        );
+    }
+
+    #[tokio::test]
+    async fn await_rejects_empty_session_ids() {
+        let (_tmp, backend) = test_backend();
+        let tool = SessionsAwaitTool::new(backend, test_security());
+        let result = tool
+            .execute(json!({"session_ids": []}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result.error.unwrap().contains("at least one"));
+    }
+
+    #[tokio::test]
+    async fn await_rejects_invalid_session_id() {
+        let (_tmp, backend) = test_backend();
+        let tool = SessionsAwaitTool::new(backend, test_security());
+        let result = tool
+            .execute(json!({"session_ids": ["///"]}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result.error.unwrap().contains("Invalid"));
+    }
+
+    #[tokio::test]
+    async fn await_rejects_invalid_mode() {
+        let (_tmp, backend) = test_backend();
+        let tool = SessionsAwaitTool::new(backend, test_security());
+        let result = tool
+            .execute(json!({"session_ids": ["test1"], "mode": "first"}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result.error.unwrap().contains("Invalid mode"));
+    }
+
+    #[tokio::test]
+    async fn await_missing_session_ids_param() {
+        let (_tmp, backend) = test_backend();
+        let tool = SessionsAwaitTool::new(backend, test_security());
+        let result = tool.execute(json!({})).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("session_ids"));
+    }
+
+    #[tokio::test]
+    async fn await_completes_immediately_with_done_marker() {
+        let (_tmp, backend) = test_backend();
+        // Seed a session with a completion marker
+        backend
+            .append("agent__task1", &ChatMessage::user("Start task"))
+            .unwrap();
+        backend
+            .append(
+                "agent__task1",
+                &ChatMessage::assistant("Task finished. [DONE]"),
+            )
+            .unwrap();
+
+        let tool = SessionsAwaitTool::new(backend, test_security());
+        let result = tool
+            .execute(json!({
+                "session_ids": ["agent__task1"],
+                "timeout_secs": 5
+            }))
+            .await
+            .unwrap();
+        assert!(result.success);
+        assert!(result.output.contains("1 session(s) completed"));
+        assert!(result.output.contains("agent__task1"));
+        assert!(result.output.contains("[DONE]"));
+    }
+
+    #[tokio::test]
+    async fn await_completes_immediately_with_complete_marker() {
+        let (_tmp, backend) = test_backend();
+        backend
+            .append(
+                "agent__task1",
+                &ChatMessage::assistant("All done [COMPLETE]"),
+            )
+            .unwrap();
+
+        let tool = SessionsAwaitTool::new(backend, test_security());
+        let result = tool
+            .execute(json!({
+                "session_ids": ["agent__task1"],
+                "timeout_secs": 5
+            }))
+            .await
+            .unwrap();
+        assert!(result.success);
+        assert!(result.output.contains("1 session(s) completed"));
+    }
+
+    #[tokio::test]
+    async fn await_any_mode_completes_when_first_done() {
+        let (_tmp, backend) = test_backend();
+        // Only task1 has completion marker
+        backend
+            .append(
+                "agent__task1",
+                &ChatMessage::assistant("Result [DONE]"),
+            )
+            .unwrap();
+        backend
+            .append(
+                "agent__task2",
+                &ChatMessage::assistant("Still working..."),
+            )
+            .unwrap();
+
+        let tool = SessionsAwaitTool::new(backend, test_security());
+        let result = tool
+            .execute(json!({
+                "session_ids": ["agent__task1", "agent__task2"],
+                "mode": "any",
+                "timeout_secs": 5
+            }))
+            .await
+            .unwrap();
+        assert!(result.success);
+        assert!(result.output.contains("1 session(s) completed"));
+        assert!(result.output.contains("agent__task1"));
+        assert!(result.output.contains("Pending sessions"));
+        assert!(result.output.contains("agent__task2"));
+    }
+
+    #[tokio::test]
+    async fn await_idle_timeout_triggers_completion() {
+        let (_tmp, backend) = test_backend();
+        // Session exists but has no completion marker — idle timeout should kick in
+        backend
+            .append("agent__idle", &ChatMessage::user("Start"))
+            .unwrap();
+
+        let tool = SessionsAwaitTool::new(backend, test_security());
+        let result = tool
+            .execute(json!({
+                "session_ids": ["agent__idle"],
+                "timeout_secs": 10,
+                "idle_timeout_secs": 1
+            }))
+            .await
+            .unwrap();
+        assert!(result.success);
+        assert!(result.output.contains("1 session(s) completed"));
+        assert!(result.output.contains("agent__idle"));
+    }
+
+    #[tokio::test]
+    async fn await_timeout_returns_partial_results() {
+        let (_tmp, backend) = test_backend();
+        // task1 is done, task2 is not
+        backend
+            .append(
+                "agent__t1",
+                &ChatMessage::assistant("Finished [DONE]"),
+            )
+            .unwrap();
+        // task2 has recent activity — use a very short overall timeout but long idle
+        backend
+            .append("agent__t2", &ChatMessage::user("Working"))
+            .unwrap();
+
+        let tool = SessionsAwaitTool::new(backend.clone(), test_security());
+
+        // Spawn a task that keeps task2 active so it never idles
+        let bg_backend = backend.clone();
+        let keepalive = tokio::spawn(async move {
+            for i in 0..5 {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                let _ = bg_backend.append(
+                    "agent__t2",
+                    &ChatMessage::user(&format!("ping {i}")),
+                );
+            }
+        });
+
+        let result = tool
+            .execute(json!({
+                "session_ids": ["agent__t1", "agent__t2"],
+                "mode": "all",
+                "timeout_secs": 3,
+                "idle_timeout_secs": 60
+            }))
+            .await
+            .unwrap();
+
+        keepalive.abort();
+
+        assert!(result.success);
+        assert!(result.output.contains("Timeout reached"));
+        assert!(result.output.contains("agent__t1"));
+    }
+
+    #[test]
+    fn has_completion_marker_detects_done() {
+        let (_tmp, backend) = test_backend();
+        backend
+            .append("s1", &ChatMessage::assistant("result [DONE]"))
+            .unwrap();
+        assert!(has_completion_marker(backend.as_ref(), "s1"));
+    }
+
+    #[test]
+    fn has_completion_marker_case_insensitive() {
+        let (_tmp, backend) = test_backend();
+        backend
+            .append("s1", &ChatMessage::assistant("result [done]"))
+            .unwrap();
+        assert!(has_completion_marker(backend.as_ref(), "s1"));
+    }
+
+    #[test]
+    fn has_completion_marker_returns_false_without_marker() {
+        let (_tmp, backend) = test_backend();
+        backend
+            .append("s1", &ChatMessage::assistant("still working"))
+            .unwrap();
+        assert!(!has_completion_marker(backend.as_ref(), "s1"));
+    }
+
+    #[test]
+    fn has_completion_marker_returns_false_for_empty_session() {
+        let (_tmp, backend) = test_backend();
+        assert!(!has_completion_marker(backend.as_ref(), "nonexistent"));
     }
 }
