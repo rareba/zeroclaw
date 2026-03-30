@@ -19,6 +19,7 @@ pub mod bluesky;
 pub mod clawdtalk;
 pub mod cli;
 pub mod debounce;
+pub mod debounce;
 pub mod dingtalk;
 pub mod discord;
 pub mod discord_history;
@@ -4373,7 +4374,8 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
                 .with_streaming(tg.stream_mode, tg.draft_update_interval_ms)
                 .with_transcription(config.transcription.clone())
                 .with_tts(config.tts.clone())
-                .with_workspace_dir(config.workspace_dir.clone()),
+                .with_workspace_dir(config.workspace_dir.clone())
+                .with_debounce(tg.debounce_ms),
             ))
         }
         "discord" => {

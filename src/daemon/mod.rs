@@ -1009,6 +1009,7 @@ mod tests {
             mention_only: false,
             ack_reactions: None,
             proxy_url: None,
+            debounce_ms: None,
         });
         assert!(has_supervised_channels(&config));
     }
@@ -1139,6 +1140,7 @@ mod tests {
             mention_only: false,
             ack_reactions: None,
             proxy_url: None,
+            debounce_ms: None,
         });
 
         let target = resolve_heartbeat_delivery(&config).unwrap();
@@ -1158,6 +1160,7 @@ mod tests {
             mention_only: false,
             ack_reactions: None,
             proxy_url: None,
+            debounce_ms: None,
         });
 
         let target = resolve_heartbeat_delivery(&config).unwrap();

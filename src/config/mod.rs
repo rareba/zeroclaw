@@ -218,6 +218,7 @@ mod tests {
             mention_only: false,
             ack_reactions: None,
             proxy_url: None,
+            debounce_ms: None,
         };
 
         let discord = DiscordConfig {

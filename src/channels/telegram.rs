@@ -1,3 +1,4 @@
+use super::debounce::{DebounceResult, MessageDebouncer};
 use super::traits::{Channel, ChannelMessage, SendMessage};
 use crate::config::{Config, StreamMode};
 use crate::security::pairing::PairingGuard;
@@ -402,6 +403,16 @@ impl TelegramChannel {
     /// Configure workspace directory for saving downloaded attachments.
     pub fn with_workspace_dir(mut self, dir: std::path::PathBuf) -> Self {
         self.workspace_dir = Some(dir);
+        self
+    }
+
+    /// Configure message debouncing. `None` or `Some(0)` disables it.
+    pub fn with_debounce(mut self, debounce_ms: Option<u64>) -> Self {
+        let window = debounce_ms
+            .filter(|&ms| ms > 0)
+            .map(Duration::from_millis)
+            .unwrap_or(Duration::ZERO);
+        self.debouncer = MessageDebouncer::new(window);
         self
     }
 
@@ -2938,20 +2949,60 @@ Ensure only one `zeroclaw` process is using this bot token."
                         }
                     }
 
-                    // Send "typing" indicator immediately when we receive a message
-                    let typing_body = serde_json::json!({
-                        "chat_id": &msg.reply_target,
-                        "action": "typing"
-                    });
-                    let _ = self
-                        .http_client()
-                        .post(self.api_url("sendChatAction"))
-                        .json(&typing_body)
-                        .send()
-                        .await; // Ignore errors for typing indicator
+                    // -- Debounce ------------------------------------------------
+                    // Use the reply_target (chat_id, or chat_id:thread_id) as the
+                    // debounce key so messages from the same conversation are grouped.
+                    let debounce_key = format!("{}:{}", msg.sender, msg.reply_target);
+                    match self.debouncer.debounce(&debounce_key, &msg.content).await {
+                        DebounceResult::Passthrough(_) => {
+                            // Debouncing disabled -- send immediately.
+                            let typing_body = serde_json::json!({
+                                "chat_id": &msg.reply_target,
+                                "action": "typing"
+                            });
+                            let _ = self
+                                .http_client()
+                                .post(self.api_url("sendChatAction"))
+                                .json(&typing_body)
+                                .send()
+                                .await;
 
-                    if tx.send(msg).await.is_err() {
-                        return Ok(());
+                            if tx.send(msg).await.is_err() {
+                                return Ok(());
+                            }
+                        }
+                        DebounceResult::Pending(rx) => {
+                            // Spawn a task that waits for the debounced combined text
+                            // and then forwards a single message downstream.
+                            let tx_clone = tx.clone();
+                            let typing_url =
+                                self.api_url("sendChatAction");
+                            let client = self.http_client();
+                            let reply_target = msg.reply_target.clone();
+                            tokio::spawn(async move {
+                                let combined = match rx.await {
+                                    Ok(c) => c,
+                                    Err(_) => return, // superseded by a newer debounce cycle
+                                };
+
+                                // Send typing indicator for the debounced message
+                                let typing_body = serde_json::json!({
+                                    "chat_id": &reply_target,
+                                    "action": "typing"
+                                });
+                                let _ = client
+                                    .post(&typing_url)
+                                    .json(&typing_body)
+                                    .send()
+                                    .await;
+
+                                let debounced_msg = ChannelMessage {
+                                    content: combined,
+                                    ..msg
+                                };
+                                let _ = tx_clone.send(debounced_msg).await;
+                            });
+                        }
                     }
                 }
             }
@@ -5096,5 +5147,70 @@ mod tests {
         let photo_content = "[IMAGE:/tmp/photo.jpg]".to_string();
         let content = format!("{attr}{photo_content}");
         assert_eq!(content, "[Forwarded from @bob] [IMAGE:/tmp/photo.jpg]");
+    }
+
+
+    // -- Debounce integration tests ----------------------------
+
+    #[test]
+    fn with_debounce_none_disables_debouncer() {
+        let ch = TelegramChannel::new("t".into(), vec!["*".into()], false).with_debounce(None);
+        assert!(!ch.debouncer.enabled());
+    }
+
+    #[test]
+    fn with_debounce_zero_disables_debouncer() {
+        let ch = TelegramChannel::new("t".into(), vec!["*".into()], false).with_debounce(Some(0));
+        assert!(!ch.debouncer.enabled());
+    }
+
+    #[test]
+    fn with_debounce_positive_enables_debouncer() {
+        let ch =
+            TelegramChannel::new("t".into(), vec!["*".into()], false).with_debounce(Some(500));
+        assert!(ch.debouncer.enabled());
+    }
+
+    #[tokio::test]
+    async fn debounce_passthrough_when_disabled() {
+        let ch = TelegramChannel::new("t".into(), vec!["*".into()], false).with_debounce(None);
+        match ch.debouncer.debounce("user:chat", "hello").await {
+            DebounceResult::Passthrough(msg) => assert_eq!(msg, "hello"),
+            DebounceResult::Pending(_) => panic!("expected Passthrough when debounce is disabled"),
+        }
+    }
+
+    #[tokio::test]
+    async fn debounce_pending_when_enabled() {
+        let ch =
+            TelegramChannel::new("t".into(), vec!["*".into()], false).with_debounce(Some(100));
+        match ch.debouncer.debounce("user:chat", "hello").await {
+            DebounceResult::Pending(rx) => {
+                let result = rx.await.unwrap();
+                assert_eq!(result, "hello");
+            }
+            DebounceResult::Passthrough(_) => panic!("expected Pending when debounce is enabled"),
+        }
+    }
+
+    #[tokio::test]
+    async fn debounce_combines_rapid_messages() {
+        let ch =
+            TelegramChannel::new("t".into(), vec!["*".into()], false).with_debounce(Some(100));
+
+        let _rx1 = match ch.debouncer.debounce("user:chat", "first").await {
+            DebounceResult::Pending(rx) => rx,
+            DebounceResult::Passthrough(_) => panic!("expected Pending"),
+        };
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let rx2 = match ch.debouncer.debounce("user:chat", "second").await {
+            DebounceResult::Pending(rx) => rx,
+            DebounceResult::Passthrough(_) => panic!("expected Pending"),
+        };
+
+        let combined = rx2.await.unwrap();
+        assert_eq!(combined, "first\nsecond");
     }
 }
