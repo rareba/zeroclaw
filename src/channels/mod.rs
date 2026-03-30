@@ -3066,6 +3066,7 @@ async fn process_channel_message(
                         ctx.max_tool_result_chars,
                         ctx.context_token_budget,
                         None, // shared_budget
+                        ctx.reliability.show_fallback_notice,
                     ),
                     ),
                     ),

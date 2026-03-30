@@ -6,6 +6,9 @@ use crate::memory::{self, Memory, MemoryCategory, decay};
 use crate::multimodal;
 use crate::observability::{self, Observer, ObserverEvent, runtime_trace};
 use crate::providers::traits::StreamEvent;
+use crate::providers::reliable::{
+    format_fallback_notice, scope_provider_fallback, take_last_provider_fallback,
+};
 use crate::providers::{
     self, ChatMessage, ChatRequest, Provider, ProviderCapabilityError, ToolCall,
 };
@@ -2159,6 +2162,7 @@ pub(crate) async fn agent_turn(
         0,    // max_tool_result_chars: 0 = disabled (legacy callers)
         0,    // context_token_budget: 0 = disabled (legacy callers)
         None, // shared_budget: no shared budget for legacy callers
+        false,
     )
     .await
 }
@@ -2297,6 +2301,7 @@ pub(crate) async fn run_tool_call_loop(
     max_tool_result_chars: usize,
     context_token_budget: usize,
     shared_budget: Option<Arc<std::sync::atomic::AtomicUsize>>,
+    show_fallback_notice: bool,
 ) -> Result<String> {
     let max_iterations = if max_tool_iterations == 0 {
         DEFAULT_MAX_TOOL_ITERATIONS
@@ -2837,11 +2842,28 @@ pub(crate) async fn run_tool_call_loop(
             }
         };
 
-        let display_text = if parsed_text.is_empty() {
+        let mut display_text = if parsed_text.is_empty() {
             response_text.clone()
         } else {
             parsed_text
         };
+
+        // Append fallback notice when provider/model differs from requested.
+        if show_fallback_notice {
+            if let Some(ref fb) = fallback_info {
+                let notice = format_fallback_notice(fb);
+                tracing::info!(
+                    requested_model = fb.requested_model,
+                    actual_provider = fb.actual_provider,
+                    actual_model = fb.actual_model,
+                    "Provider fallback occurred"
+                );
+                if tool_calls.is_empty() {
+                    // Final response -- append the notice so the user sees it.
+                    display_text = format!("{display_text}\n\n{notice}");
+                }
+            }
+        }
 
         // ── Progress: LLM responded ─────────────────────────────
         if let Some(ref tx) = on_delta {
@@ -3990,6 +4012,7 @@ pub async fn run(
                         config.agent.max_tool_result_chars,
                         config.agent.max_context_tokens,
                         None, // shared_budget
+                        config.reliability.show_fallback_notice,
                     ),
                 )
                 .await
@@ -4300,6 +4323,7 @@ pub async fn run(
                             config.agent.max_tool_result_chars,
                             config.agent.max_context_tokens,
                             None, // shared_budget
+                            config.reliability.show_fallback_notice,
                         ),
                     )
                     .await
@@ -5203,6 +5227,7 @@ mod tests {
             Some(&activated),
             &observer,
             None,
+            false,
         )
         .await
         .expect("suffix alias should execute the unique activated tool");
@@ -5847,6 +5872,7 @@ mod tests {
             0,
             0,
             None,
+            false,
         )
         .await
         .expect_err("provider without vision support should fail");
@@ -5902,6 +5928,7 @@ mod tests {
             0,
             0,
             None,
+            false,
         )
         .await
         .expect_err("oversized payload must fail");
@@ -5951,6 +5978,7 @@ mod tests {
             0,
             0,
             None,
+            false,
         )
         .await
         .expect("valid multimodal payload should pass");
@@ -5999,6 +6027,7 @@ mod tests {
             0,
             0,
             None,
+            false,
         )
         .await
         .expect_err("should fail without vision_provider config");
@@ -6054,6 +6083,7 @@ mod tests {
             0,
             0,
             None,
+            false,
         )
         .await
         .expect_err("should fail when vision provider cannot be created");
@@ -6109,6 +6139,7 @@ mod tests {
             0,
             0,
             None,
+            false,
         )
         .await
         .expect("text-only messages should succeed with default provider");
@@ -6165,6 +6196,7 @@ mod tests {
             0,
             0,
             None,
+            false,
         )
         .await
         .expect_err("should fail due to nonexistent vision provider");
@@ -6219,6 +6251,7 @@ mod tests {
             0,
             0,
             None,
+            false,
         )
         .await
         .expect("empty image markers should not trigger vision routing");
@@ -6273,6 +6306,7 @@ mod tests {
             0,
             0,
             None,
+            false,
         )
         .await
         .expect_err("should attempt vision provider creation for multiple images");
@@ -6410,6 +6444,7 @@ mod tests {
             0,
             0,
             None,
+            false,
         )
         .await
         .expect("parallel execution should complete");
@@ -6484,6 +6519,7 @@ mod tests {
             0,
             0,
             None,
+            false,
         )
         .await
         .expect("cron_add delivery defaults should be injected");
@@ -6550,6 +6586,7 @@ mod tests {
             0,
             0,
             None,
+            false,
         )
         .await
         .expect("explicit delivery mode should be preserved");
@@ -6611,6 +6648,7 @@ mod tests {
             0,
             0,
             None,
+            false,
         )
         .await
         .expect("loop should finish after deduplicating repeated calls");
@@ -6684,6 +6722,7 @@ mod tests {
             0,
             0,
             None,
+            false,
         )
         .await
         .expect("non-interactive shell should succeed for low-risk command");
@@ -6748,6 +6787,7 @@ mod tests {
             0,
             0,
             None,
+            false,
         )
         .await
         .expect("loop should finish with exempt tool executing twice");
@@ -6832,6 +6872,7 @@ mod tests {
             0,
             0,
             None,
+            false,
         )
         .await
         .expect("loop should complete");
@@ -6893,6 +6934,7 @@ mod tests {
             0,
             0,
             None,
+            false,
         )
         .await
         .expect("native fallback id flow should complete");
@@ -6978,6 +7020,7 @@ mod tests {
             0,
             0,
             None,
+            false,
         )
         .await
         .expect("native tool-call text should be relayed through on_delta");
@@ -7047,6 +7090,7 @@ mod tests {
             0,
             0,
             None,
+            false,
         )
         .await
         .expect("streaming provider should complete");
@@ -7118,6 +7162,7 @@ mod tests {
             0,
             0,
             None,
+            false,
         )
         .await
         .expect("streaming tool loop should execute tool and finish");
@@ -7193,6 +7238,7 @@ mod tests {
             0,
             0,
             None,
+            false,
         )
         .await
         .expect("native streaming events should preserve tool loop semantics");
@@ -7277,6 +7323,7 @@ mod tests {
             0,
             0,
             None,
+            false,
         )
         .await
         .expect("routed streaming provider should complete");
@@ -7363,6 +7410,7 @@ mod tests {
                 &[],
                 Some(&activated),
                 None,
+                false,
             )
             .await
             .expect("wrapper path should execute activated tools");
@@ -8100,6 +8148,7 @@ Tail"#;
             "User suffered a fabricated event",
             MemoryCategory::Daily,
             None,
+            false,
         )
         .await
         .unwrap();
@@ -8108,6 +8157,7 @@ Tail"#;
             "User asked for concise status updates",
             MemoryCategory::Conversation,
             None,
+            false,
         )
         .await
         .unwrap();
@@ -9290,6 +9340,7 @@ Let me check the result."#;
             0,
             0,
             None,
+            false,
         )
         .await
         .expect("tool loop should complete");
@@ -9587,6 +9638,7 @@ Let me check the result."#;
             0,
             0,
             None,
+            false,
         )
         .await
         .expect("should succeed without cost scope");

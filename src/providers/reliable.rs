@@ -66,6 +66,14 @@ fn record_provider_fallback(
     });
 }
 
+/// Format a user-visible notice about a provider fallback.
+pub fn format_fallback_notice(info: &ProviderFallbackInfo) -> String {
+    format!(
+        "\u{26a1} Answered by {}/{} (requested: {})",
+        info.actual_provider, info.actual_model, info.requested_model,
+    )
+}
+
 // ── Error Classification ─────────────────────────────────────────────────
 // Errors are split into retryable (transient server/network failures) and
 // non-retryable (permanent client errors). This distinction drives whether
@@ -3019,5 +3027,75 @@ mod tests {
             assert!(take_last_provider_fallback().is_none());
         })
         .await;
+    }
+
+
+    // -- Fallback notice formatting tests ---------------------
+
+    #[test]
+    fn format_fallback_notice_shows_actual_and_requested() {
+        let info = ProviderFallbackInfo {
+            requested_provider: "anthropic".to_string(),
+            requested_model: "claude-sonnet".to_string(),
+            actual_provider: "openai".to_string(),
+            actual_model: "gpt-4o".to_string(),
+        };
+        let notice = format_fallback_notice(&info);
+        assert!(notice.contains("openai/gpt-4o"));
+        assert!(notice.contains("claude-sonnet"));
+        assert!(notice.starts_with('\u{26a1}'));
+    }
+
+    #[test]
+    fn format_fallback_notice_same_provider_different_model() {
+        let info = ProviderFallbackInfo {
+            requested_provider: "anthropic".to_string(),
+            requested_model: "claude-opus".to_string(),
+            actual_provider: "anthropic".to_string(),
+            actual_model: "claude-sonnet".to_string(),
+        };
+        let notice = format_fallback_notice(&info);
+        assert!(notice.contains("anthropic/claude-sonnet"));
+        assert!(notice.contains("claude-opus"));
+    }
+
+    #[tokio::test]
+    async fn scope_provider_fallback_records_and_retrieves() {
+        scope_provider_fallback(async {
+            record_provider_fallback("primary", "model-a", "fallback", "model-b");
+            let fb = take_last_provider_fallback();
+            assert!(fb.is_some());
+            let fb = fb.unwrap();
+            assert_eq!(fb.requested_provider, "primary");
+            assert_eq!(fb.requested_model, "model-a");
+            assert_eq!(fb.actual_provider, "fallback");
+            assert_eq!(fb.actual_model, "model-b");
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn take_clears_fallback_info() {
+        scope_provider_fallback(async {
+            record_provider_fallback("p", "m", "fp", "fm");
+            let _ = take_last_provider_fallback();
+            // Second take should be None
+            assert!(take_last_provider_fallback().is_none());
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn no_fallback_returns_none() {
+        scope_provider_fallback(async {
+            assert!(take_last_provider_fallback().is_none());
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn take_outside_scope_returns_none() {
+        // Without scope_provider_fallback, try_with fails gracefully
+        assert!(take_last_provider_fallback().is_none());
     }
 }

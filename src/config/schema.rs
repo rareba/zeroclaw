@@ -5773,6 +5773,11 @@ pub struct ReliabilityConfig {
     /// Max retries for cron job execution attempts.
     #[serde(default = "default_scheduler_retries")]
     pub scheduler_retries: u32,
+    /// Show a user-visible notice when a provider fallback occurs.
+    /// When `true`, responses served by a fallback provider/model include a
+    /// short line such as `\u26a1 Answered by openai/gpt-4o (requested: claude-sonnet)`.
+    #[serde(default = "default_show_fallback_notice")]
+    pub show_fallback_notice: bool,
 }
 
 fn default_provider_retries() -> u32 {
@@ -5799,6 +5804,10 @@ fn default_scheduler_retries() -> u32 {
     2
 }
 
+fn default_show_fallback_notice() -> bool {
+    true
+}
+
 impl Default for ReliabilityConfig {
     fn default() -> Self {
         Self {
@@ -5811,6 +5820,7 @@ impl Default for ReliabilityConfig {
             channel_max_backoff_secs: default_channel_backoff_max_secs(),
             scheduler_poll_secs: default_scheduler_poll_secs(),
             scheduler_retries: default_scheduler_retries(),
+            show_fallback_notice: default_show_fallback_notice(),
         }
     }
 }
