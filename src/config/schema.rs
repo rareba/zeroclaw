@@ -5407,6 +5407,10 @@ impl Default for HooksConfig {
 pub struct BuiltinHooksConfig {
     /// Enable the command-logger hook (logs tool calls for auditing).
     pub command_logger: bool,
+    /// Enable the session-logger hook (logs session start/end with duration and
+    /// message count).
+    #[serde(default)]
+    pub session_logger: bool,
     /// Configuration for the webhook-audit hook.
     ///
     /// When enabled, POSTs a JSON payload to `url` for every tool invocation

@@ -9,6 +9,8 @@ use zeroclaw::tools::ToolResult;
 struct CounterHook {
     gateway_starts: Arc<AtomicUsize>,
     tool_calls: Arc<AtomicUsize>,
+    session_starts: Arc<AtomicUsize>,
+    session_ends: Arc<AtomicUsize>,
 }
 
 #[async_trait]
@@ -23,6 +25,14 @@ impl HookHandler for CounterHook {
 
     async fn on_after_tool_call(&self, _tool: &str, _result: &ToolResult, _duration: Duration) {
         self.tool_calls.fetch_add(1, Ordering::SeqCst);
+    }
+
+    async fn on_session_start(&self, _session_id: &str, _channel: &str) {
+        self.session_starts.fetch_add(1, Ordering::SeqCst);
+    }
+
+    async fn on_session_end(&self, _session_id: &str, _channel: &str) {
+        self.session_ends.fetch_add(1, Ordering::SeqCst);
     }
 }
 
@@ -57,11 +67,15 @@ impl HookHandler for ToolBlocker {
 async fn hook_runner_full_pipeline() {
     let gateway_starts = Arc::new(AtomicUsize::new(0));
     let tool_calls = Arc::new(AtomicUsize::new(0));
+    let session_starts = Arc::new(AtomicUsize::new(0));
+    let session_ends = Arc::new(AtomicUsize::new(0));
 
     let mut runner = HookRunner::new();
     runner.register(Box::new(CounterHook {
         gateway_starts: gateway_starts.clone(),
         tool_calls: tool_calls.clone(),
+        session_starts: session_starts.clone(),
+        session_ends: session_ends.clone(),
     }));
     runner.register(Box::new(ToolBlocker {
         blocked_tools: vec!["dangerous".into()],
@@ -93,4 +107,38 @@ async fn hook_runner_full_pipeline() {
         .fire_after_tool_call("safe_tool", &tool_result, Duration::from_millis(10))
         .await;
     assert_eq!(tool_calls.load(Ordering::SeqCst), 1);
+
+    // Session lifecycle hooks
+    runner.fire_session_start("sess-1", "telegram").await;
+    assert_eq!(session_starts.load(Ordering::SeqCst), 1);
+    assert_eq!(session_ends.load(Ordering::SeqCst), 0);
+
+    runner.fire_session_end("sess-1", "telegram").await;
+    assert_eq!(session_starts.load(Ordering::SeqCst), 1);
+    assert_eq!(session_ends.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn session_end_fires_for_all_registered_hooks() {
+    let ends_a = Arc::new(AtomicUsize::new(0));
+    let ends_b = Arc::new(AtomicUsize::new(0));
+
+    let mut runner = HookRunner::new();
+    runner.register(Box::new(CounterHook {
+        gateway_starts: Arc::new(AtomicUsize::new(0)),
+        tool_calls: Arc::new(AtomicUsize::new(0)),
+        session_starts: Arc::new(AtomicUsize::new(0)),
+        session_ends: ends_a.clone(),
+    }));
+    runner.register(Box::new(CounterHook {
+        gateway_starts: Arc::new(AtomicUsize::new(0)),
+        tool_calls: Arc::new(AtomicUsize::new(0)),
+        session_starts: Arc::new(AtomicUsize::new(0)),
+        session_ends: ends_b.clone(),
+    }));
+
+    runner.fire_session_end("sess-2", "slack").await;
+
+    assert_eq!(ends_a.load(Ordering::SeqCst), 1);
+    assert_eq!(ends_b.load(Ordering::SeqCst), 1);
 }

@@ -2627,6 +2627,10 @@ async fn process_channel_message(
 
     let force_fresh_session = take_pending_new_session(ctx.as_ref(), &history_key);
     if force_fresh_session {
+        // Fire session_end for the old session being replaced.
+        if let Some(hooks) = &ctx.hooks {
+            hooks.fire_session_end(&history_key, &msg.channel).await;
+        }
         // `/new` should make the next user turn completely fresh even if
         // older cached turns reappear before this message starts.
         clear_sender_history(ctx.as_ref(), &history_key);
@@ -2642,6 +2646,15 @@ async fn process_channel_message(
             .is_some_and(|turns| !turns.is_empty())
     };
 
+
+    // Fire session_start for new sessions (first message or after /new).
+    if !had_prior_history {
+        if let Some(hooks) = &ctx.hooks {
+            hooks
+                .fire_session_start(&history_key, &msg.channel)
+                .await;
+        }
+    }
     // Preserve user turn before the LLM call so interrupted requests keep context.
     append_sender_turn(ctx.as_ref(), &history_key, ChatMessage::user(&msg.content));
 
@@ -5865,6 +5878,9 @@ pub async fn start_channels(config: Config) -> Result<()> {
             let mut runner = crate::hooks::HookRunner::new();
             if config.hooks.builtin.command_logger {
                 runner.register(Box::new(crate::hooks::builtin::CommandLoggerHook::new()));
+            }
+            if config.hooks.builtin.session_logger {
+                runner.register(Box::new(crate::hooks::builtin::SessionLoggerHook::new()));
             }
             if config.hooks.builtin.webhook_audit.enabled {
                 runner.register(Box::new(crate::hooks::builtin::WebhookAuditHook::new(

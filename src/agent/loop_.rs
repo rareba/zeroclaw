@@ -3868,6 +3868,28 @@ pub async fn run(
                 ToolLoopCostTrackingContext::new(tracker, Arc::new(config.cost.prices.clone()))
             });
 
+    // ── Hooks ────────────────────────────────────────────────────────
+    let hooks = if config.hooks.enabled {
+        let mut runner = crate::hooks::HookRunner::new();
+        if config.hooks.builtin.command_logger {
+            runner.register(Box::new(crate::hooks::builtin::CommandLoggerHook::new()));
+        }
+        if config.hooks.builtin.session_logger {
+            runner.register(Box::new(crate::hooks::builtin::SessionLoggerHook::new()));
+        }
+        Some(runner)
+    } else {
+        None
+    };
+    let cli_session_id = memory_session_id
+        .clone()
+        .unwrap_or_else(|| format!("cli:{}", Uuid::new_v4()));
+    if let Some(ref hooks) = hooks {
+        hooks
+            .fire_session_start(&cli_session_id, channel_name)
+            .await;
+    }
+
     // ── Execute ──────────────────────────────────────────────────
     let start = Instant::now();
 
@@ -4450,6 +4472,11 @@ pub async fn run(
                 save_interactive_session_history(path, &history)?;
             }
         }
+    }
+
+    // ── Fire session end hook ──────────────────────────────────────────
+    if let Some(ref hooks) = hooks {
+        hooks.fire_session_end(&cli_session_id, channel_name).await;
     }
 
     let duration = start.elapsed();
