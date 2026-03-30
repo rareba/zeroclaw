@@ -1,3 +1,4 @@
+use super::file_detect::{self, FileType};
 use super::traits::{Tool, ToolResult};
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
@@ -5,6 +6,9 @@ use serde_json::json;
 use std::sync::Arc;
 
 const MAX_FILE_SIZE_BYTES: u64 = 10 * 1024 * 1024;
+
+/// Size of the header buffer read for binary file detection (8 KiB).
+const DETECT_HEADER_SIZE: usize = 8192;
 
 /// Read file contents with path sandboxing
 pub struct FileReadTool {
@@ -24,7 +28,9 @@ impl Tool for FileReadTool {
     }
 
     fn description(&self) -> &str {
-        "Read file contents with line numbers. Supports partial reading via offset and limit. Extracts text from PDF; other binary files are read with lossy UTF-8 conversion."
+        "Read file contents with line numbers. Supports partial reading via offset and limit. \
+         Detects binary files (images, PDFs, office docs, executables) and returns a short \
+         summary instead of raw bytes. Extracts text from PDFs when possible."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -108,7 +114,7 @@ impl Tool for FileReadTool {
         }
 
         // Check file size AFTER canonicalization to prevent TOCTOU symlink bypass
-        match tokio::fs::metadata(&resolved_path).await {
+        let file_size = match tokio::fs::metadata(&resolved_path).await {
             Ok(meta) => {
                 if meta.len() > MAX_FILE_SIZE_BYTES {
                     return Ok(ToolResult {
@@ -120,12 +126,77 @@ impl Tool for FileReadTool {
                         )),
                     });
                 }
+                meta.len()
             }
             Err(e) => {
                 return Ok(ToolResult {
                     success: false,
                     output: String::new(),
                     error: Some(format!("Failed to read file metadata: {e}")),
+                });
+            }
+        };
+
+        // ── Binary file detection ──
+        // Read a small header (first 8 KiB) to classify the file before
+        // committing to a full read. This avoids wasting LLM tokens on
+        // lossy UTF-8 conversions of images, executables, archives, etc.
+        let header = read_header(&resolved_path, DETECT_HEADER_SIZE).await;
+        let file_type = file_detect::detect_file_type(&resolved_path, header.as_deref());
+        let size_str = file_detect::format_size(file_size);
+
+        match &file_type {
+            FileType::Text => { /* fall through to normal read */ }
+            FileType::Pdf => {
+                // Read full bytes and delegate to PDF extraction.
+                let bytes = tokio::fs::read(&resolved_path)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("Failed to read file: {e}"))?;
+                if let Some(text) = try_extract_pdf_text(&bytes) {
+                    return Ok(ToolResult {
+                        success: true,
+                        output: text,
+                        error: None,
+                    });
+                }
+                // PDF extraction unavailable or empty -- suggest pdf_read tool.
+                return Ok(ToolResult {
+                    success: true,
+                    output: format!(
+                        "This is a PDF file ({size_str}). \
+                         Use the `pdf_read` tool for text extraction."
+                    ),
+                    error: None,
+                });
+            }
+            FileType::Office { mime } => {
+                return Ok(ToolResult {
+                    success: true,
+                    output: format!(
+                        "This is a {mime} file ({size_str}). \
+                         Use an appropriate conversion tool to extract text content."
+                    ),
+                    error: None,
+                });
+            }
+            FileType::Image { mime } => {
+                return Ok(ToolResult {
+                    success: true,
+                    output: format!(
+                        "This is an image file ({mime}, {size_str}). \
+                         Use the image viewing capability or multimodal input."
+                    ),
+                    error: None,
+                });
+            }
+            FileType::Binary { mime } => {
+                return Ok(ToolResult {
+                    success: true,
+                    output: format!(
+                        "This is a binary file ({mime}, {size_str}). \
+                         Cannot display as text."
+                    ),
+                    error: None,
                 });
             }
         }
@@ -231,6 +302,18 @@ fn try_extract_pdf_text(bytes: &[u8]) -> Option<String> {
 #[cfg(not(feature = "rag-pdf"))]
 fn try_extract_pdf_text(_bytes: &[u8]) -> Option<String> {
     None
+}
+
+/// Read at most `max_bytes` from the start of a file for detection purposes.
+/// Returns `None` if the file cannot be opened.
+async fn read_header(path: &std::path::Path, max_bytes: usize) -> Option<Vec<u8>> {
+    use tokio::io::AsyncReadExt;
+
+    let mut file = tokio::fs::File::open(path).await.ok()?;
+    let mut buf = vec![0u8; max_bytes];
+    let n = file.read(&mut buf).await.ok()?;
+    buf.truncate(n);
+    Some(buf)
 }
 
 #[cfg(test)]
@@ -632,7 +715,8 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
-    /// PDF files should be readable via pdf-extract text extraction.
+    /// PDF files: with rag-pdf, extracted text contains "Hello";
+    /// without rag-pdf, binary detection returns a helpful message.
     #[tokio::test]
     async fn file_read_extracts_pdf_text() {
         let dir = std::env::temp_dir().join("zeroclaw_test_file_read_pdf");
@@ -653,23 +737,29 @@ mod tests {
             "PDF read must succeed, error: {:?}",
             result.error
         );
+
+        // With rag-pdf: extracted text contains "Hello".
+        // Without rag-pdf: binary detection returns a pdf_read suggestion.
+        let has_text = result.output.contains("Hello");
+        let has_suggestion = result.output.contains("pdf_read");
         assert!(
-            result.output.contains("Hello"),
-            "extracted text must contain 'Hello', got: {}",
+            has_text || has_suggestion,
+            "expected extracted text or pdf_read suggestion, got: {}",
             result.output
         );
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
-    /// Non-UTF-8 binary files should be read with lossy conversion.
+    /// Non-UTF-8 binary files with null bytes now return a binary summary
+    /// instead of lossy content.
     #[tokio::test]
-    async fn file_read_lossy_reads_binary_file() {
-        let dir = std::env::temp_dir().join("zeroclaw_test_file_read_lossy");
+    async fn file_read_binary_detection_null_bytes() {
+        let dir = std::env::temp_dir().join("zeroclaw_test_file_read_binary_null");
         let _ = tokio::fs::remove_dir_all(&dir).await;
         tokio::fs::create_dir_all(&dir).await.unwrap();
 
-        // Write bytes that are not valid UTF-8 and not a PDF
+        // Write bytes that are not valid UTF-8 and not a PDF (no known extension)
         let binary_data: Vec<u8> = vec![0x00, 0x80, 0xFF, 0xFE, b'h', b'i', 0x80];
         tokio::fs::write(dir.join("data.bin"), &binary_data)
             .await
@@ -680,17 +770,108 @@ mod tests {
 
         assert!(
             result.success,
-            "lossy read must succeed, error: {:?}",
+            "binary read must succeed, error: {:?}",
             result.error
         );
         assert!(
-            result.output.contains('\u{FFFD}'),
-            "lossy output must contain replacement character, got: {:?}",
+            result.output.contains("binary file"),
+            "expected binary summary, got: {}",
             result.output
         );
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    /// Image files return an informative message about using multimodal input.
+    #[tokio::test]
+    async fn file_read_binary_detection_image() {
+        let dir = std::env::temp_dir().join("zeroclaw_test_file_read_detect_img");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+
+        tokio::fs::write(dir.join("photo.png"), b"not really a png")
+            .await
+            .unwrap();
+
+        let tool = FileReadTool::new(test_security(dir.clone()));
+        let result = tool.execute(json!({"path": "photo.png"})).await.unwrap();
+
+        assert!(result.success);
         assert!(
-            result.output.contains("hi"),
-            "lossy output must preserve valid ASCII, got: {:?}",
+            result.output.contains("image file") && result.output.contains("image/png"),
+            "expected image summary, got: {}",
+            result.output
+        );
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    /// Office documents return a helpful message about using a conversion tool.
+    #[tokio::test]
+    async fn file_read_binary_detection_office() {
+        let dir = std::env::temp_dir().join("zeroclaw_test_file_read_detect_office");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+
+        tokio::fs::write(dir.join("report.docx"), b"fake docx content")
+            .await
+            .unwrap();
+
+        let tool = FileReadTool::new(test_security(dir.clone()));
+        let result = tool.execute(json!({"path": "report.docx"})).await.unwrap();
+
+        assert!(result.success);
+        assert!(
+            result.output.contains("conversion tool"),
+            "expected office conversion hint, got: {}",
+            result.output
+        );
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    /// Generic binary files (e.g. zip) return a cannot-display message.
+    #[tokio::test]
+    async fn file_read_binary_detection_generic() {
+        let dir = std::env::temp_dir().join("zeroclaw_test_file_read_detect_generic");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+
+        tokio::fs::write(dir.join("archive.zip"), b"PK\x03\x04 fake zip")
+            .await
+            .unwrap();
+
+        let tool = FileReadTool::new(test_security(dir.clone()));
+        let result = tool.execute(json!({"path": "archive.zip"})).await.unwrap();
+
+        assert!(result.success);
+        assert!(
+            result.output.contains("binary file") && result.output.contains("Cannot display"),
+            "expected binary cannot-display message, got: {}",
+            result.output
+        );
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    /// Text files are still read normally with binary detection.
+    #[tokio::test]
+    async fn file_read_text_unaffected_by_detection() {
+        let dir = std::env::temp_dir().join("zeroclaw_test_file_read_detect_text");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+
+        tokio::fs::write(dir.join("code.rs"), "fn main() {}\n")
+            .await
+            .unwrap();
+
+        let tool = FileReadTool::new(test_security(dir.clone()));
+        let result = tool.execute(json!({"path": "code.rs"})).await.unwrap();
+
+        assert!(result.success);
+        assert!(
+            result.output.contains("fn main()"),
+            "text file should be read normally, got: {}",
             result.output
         );
 
@@ -842,11 +1023,11 @@ mod tests {
 
         // ── Verify final response ──
         assert!(
-            response.contains("Hello PDF"),
-            "agent response must contain PDF content, got: {response}",
+            response.contains("Hello PDF") || response.contains("binary"),
+            "agent response must contain PDF content or binary mention, got: {response}",
         );
 
-        // ── Verify provider received extracted PDF text in tool result ──
+        // ── Verify provider received PDF text or summary in tool result ──
         {
             let all_requests = recorded.lock().unwrap();
             assert!(
@@ -861,9 +1042,11 @@ mod tests {
                 .find(|m| m.role == "tool")
                 .expect("second request must contain a tool result message");
 
+            let has_text = tool_result_msg.content.contains("Hello");
+            let has_suggestion = tool_result_msg.content.contains("pdf_read");
             assert!(
-                tool_result_msg.content.contains("Hello"),
-                "tool result must contain extracted PDF text 'Hello', got: {}",
+                has_text || has_suggestion,
+                "tool result must contain extracted PDF text or pdf_read suggestion, got: {}",
                 tool_result_msg.content,
             );
         }
@@ -871,17 +1054,17 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(&workspace).await;
     }
 
-    /// End-to-end test: agent calls `file_read` on a binary file, gets
-    /// lossy UTF-8 output with replacement characters in the tool result.
+    /// End-to-end test: agent calls `file_read` on a binary file, gets a
+    /// concise binary summary in the tool result instead of lossy content.
     #[tokio::test]
-    async fn e2e_agent_file_read_lossy_binary() {
+    async fn e2e_agent_file_read_binary_detection() {
         use crate::agent::agent::Agent;
         use crate::agent::dispatcher::NativeToolDispatcher;
         use crate::providers::{ChatResponse, Provider, ToolCall};
         use e2e_helpers::*;
 
         // ── Set up workspace with binary file ──
-        let workspace = std::env::temp_dir().join("zeroclaw_test_e2e_file_read_lossy");
+        let workspace = std::env::temp_dir().join("zeroclaw_test_e2e_file_read_binary_detect");
         let _ = tokio::fs::remove_dir_all(&workspace).await;
         tokio::fs::create_dir_all(&workspace).await.unwrap();
 
@@ -933,7 +1116,7 @@ mod tests {
             "agent response must mention binary, got: {response}",
         );
 
-        // Verify tool result contains lossy output with replacement chars
+        // Verify tool result contains a binary summary (not lossy content)
         {
             let all_requests = recorded.lock().unwrap();
             assert!(
@@ -948,13 +1131,8 @@ mod tests {
                 .expect("second request must contain a tool result message");
 
             assert!(
-                tool_result_msg.content.contains("valid"),
-                "tool result must preserve valid ASCII from binary file, got: {}",
-                tool_result_msg.content,
-            );
-            assert!(
-                tool_result_msg.content.contains('\u{FFFD}'),
-                "tool result must contain replacement character for invalid bytes, got: {}",
+                tool_result_msg.content.contains("binary file"),
+                "tool result must contain binary summary, got: {}",
                 tool_result_msg.content,
             );
         }

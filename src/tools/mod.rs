@@ -40,6 +40,7 @@ pub mod data_management;
 pub mod delegate;
 pub mod discord_search;
 pub mod escalate;
+pub mod file_detect;
 pub mod file_edit;
 pub mod file_read;
 pub mod file_write;
