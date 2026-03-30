@@ -150,6 +150,17 @@ pub struct CronJob {
     /// When `None`, all tools are available (backward compatible default).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allowed_tools: Option<Vec<String>>,
+    /// Optional deadline: when set, the job switches to a faster interval as
+    /// the deadline approaches.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deadline_at: Option<DateTime<Utc>>,
+    /// The faster interval (in milliseconds) to use inside the deadline window.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deadline_interval_ms: Option<u64>,
+    /// How many seconds before the deadline to activate the faster interval.
+    /// Defaults to 3600 (1 hour) when `deadline_at` is set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deadline_window_secs: Option<u64>,
     /// How the job was created: `"imperative"` (CLI/API) or `"declarative"` (config).
     #[serde(default = "default_source")]
     pub source: String,
@@ -183,6 +194,9 @@ pub struct CronJobPatch {
     pub session_target: Option<SessionTarget>,
     pub delete_after_run: Option<bool>,
     pub allowed_tools: Option<Vec<String>>,
+    pub deadline_at: Option<DateTime<Utc>>,
+    pub deadline_interval_ms: Option<u64>,
+    pub deadline_window_secs: Option<u64>,
 }
 
 #[cfg(test)]

@@ -1,8 +1,10 @@
 use super::traits::{Tool, ToolResult};
 use crate::config::Config;
 use crate::cron::{
-    self, DeliveryConfig, JobType, Schedule, SessionTarget, deserialize_maybe_stringified,
+    self, CronJobPatch, DeliveryConfig, JobType, Schedule, SessionTarget,
+    deserialize_maybe_stringified,
 };
+use chrono::DateTime;
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
 use serde_json::json;
@@ -162,6 +164,18 @@ impl Tool for CronAddTool {
                 "delete_after_run": {
                     "type": "boolean",
                     "description": "If true, the job is automatically deleted after its first successful run. Defaults to true for 'at' schedules."
+                },
+                "deadline_at": {
+                    "type": "string",
+                    "description": "Optional ISO 8601 UTC datetime for the deadline. When set with deadline_interval_ms, the job switches to a faster interval as the deadline approaches."
+                },
+                "deadline_interval_ms": {
+                    "type": "integer",
+                    "description": "The faster interval in milliseconds to use when inside the deadline window. Required if deadline_at is set."
+                },
+                "deadline_window_secs": {
+                    "type": "integer",
+                    "description": "How many seconds before the deadline to switch to the faster interval. Defaults to 3600 (1 hour)."
                 },
                 "approved": {
                     "type": "boolean",
@@ -351,20 +365,70 @@ impl Tool for CronAddTool {
             }
         };
 
+        // Parse optional deadline fields and apply them post-creation.
+        let deadline_at = match args.get("deadline_at").and_then(serde_json::Value::as_str) {
+            Some(s) => match DateTime::parse_from_rfc3339(s) {
+                Ok(dt) => Some(dt.with_timezone(&chrono::Utc)),
+                Err(e) => {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(format!("Invalid deadline_at: {e}")),
+                    });
+                }
+            },
+            None => None,
+        };
+        let deadline_interval_ms = args
+            .get("deadline_interval_ms")
+            .and_then(serde_json::Value::as_u64);
+        let deadline_window_secs = args
+            .get("deadline_window_secs")
+            .and_then(serde_json::Value::as_u64);
+
+        let has_deadline_fields =
+            deadline_at.is_some() || deadline_interval_ms.is_some() || deadline_window_secs.is_some();
+
         match result {
-            Ok(job) => Ok(ToolResult {
-                success: true,
-                output: serde_json::to_string_pretty(&json!({
-                    "id": job.id,
-                    "name": job.name,
-                    "job_type": job.job_type,
-                    "schedule": job.schedule,
-                    "next_run": job.next_run,
-                    "enabled": job.enabled,
-                    "allowed_tools": job.allowed_tools
-                }))?,
-                error: None,
-            }),
+            Ok(job) => {
+                let job = if has_deadline_fields {
+                    let patch = CronJobPatch {
+                        deadline_at,
+                        deadline_interval_ms,
+                        deadline_window_secs,
+                        ..CronJobPatch::default()
+                    };
+                    match cron::update_job(&self.config, &job.id, patch) {
+                        Ok(updated) => updated,
+                        Err(e) => {
+                            return Ok(ToolResult {
+                                success: false,
+                                output: String::new(),
+                                error: Some(format!("Failed to set deadline fields: {e}")),
+                            });
+                        }
+                    }
+                } else {
+                    job
+                };
+
+                Ok(ToolResult {
+                    success: true,
+                    output: serde_json::to_string_pretty(&json!({
+                        "id": job.id,
+                        "name": job.name,
+                        "job_type": job.job_type,
+                        "schedule": job.schedule,
+                        "next_run": job.next_run,
+                        "enabled": job.enabled,
+                        "allowed_tools": job.allowed_tools,
+                        "deadline_at": job.deadline_at,
+                        "deadline_interval_ms": job.deadline_interval_ms,
+                        "deadline_window_secs": job.deadline_window_secs
+                    }))?,
+                    error: None,
+                })
+            }
             Err(e) => Ok(ToolResult {
                 success: false,
                 output: String::new(),

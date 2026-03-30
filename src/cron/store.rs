@@ -1,7 +1,8 @@
 use crate::config::Config;
 use crate::cron::{
     CronJob, CronJobPatch, CronRun, DeliveryConfig, JobType, Schedule, SessionTarget,
-    next_run_for_schedule, schedule_cron_expression, validate_delivery_config, validate_schedule,
+    next_run_for_job, next_run_for_schedule, schedule_cron_expression, validate_delivery_config,
+    validate_schedule,
 };
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -124,7 +125,8 @@ pub fn list_jobs(config: &Config) -> Result<Vec<CronJob>> {
         let mut stmt = conn.prepare(
             "SELECT id, expression, command, schedule, job_type, prompt, name, session_target, model,
                     enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output,
-                    allowed_tools, source
+                    allowed_tools, source,
+                    deadline_at, deadline_interval_ms, deadline_window_secs
              FROM cron_jobs ORDER BY next_run ASC",
         )?;
 
@@ -143,7 +145,8 @@ pub fn get_job(config: &Config, job_id: &str) -> Result<CronJob> {
         let mut stmt = conn.prepare(
             "SELECT id, expression, command, schedule, job_type, prompt, name, session_target, model,
                     enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output,
-                    allowed_tools, source
+                    allowed_tools, source,
+                    deadline_at, deadline_interval_ms, deadline_window_secs
              FROM cron_jobs WHERE id = ?1",
         )?;
 
@@ -177,7 +180,8 @@ pub fn due_jobs(config: &Config, now: DateTime<Utc>) -> Result<Vec<CronJob>> {
         let mut stmt = conn.prepare(
             "SELECT id, expression, command, schedule, job_type, prompt, name, session_target, model,
                     enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output,
-                    allowed_tools, source
+                    allowed_tools, source,
+                    deadline_at, deadline_interval_ms, deadline_window_secs
              FROM cron_jobs
              WHERE enabled = 1 AND next_run <= ?1
              ORDER BY next_run ASC
@@ -207,7 +211,8 @@ pub fn all_overdue_jobs(config: &Config, now: DateTime<Utc>) -> Result<Vec<CronJ
         let mut stmt = conn.prepare(
             "SELECT id, expression, command, schedule, job_type, prompt, name, session_target, model,
                     enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output,
-                    allowed_tools, source
+                    allowed_tools, source,
+                    deadline_at, deadline_interval_ms, deadline_window_secs
              FROM cron_jobs
              WHERE enabled = 1 AND next_run <= ?1
              ORDER BY next_run ASC",
@@ -269,9 +274,18 @@ pub fn update_job(config: &Config, job_id: &str, patch: CronJobPatch) -> Result<
             job.allowed_tools = Some(allowed_tools);
         }
     }
+    if let Some(deadline_at) = patch.deadline_at {
+        job.deadline_at = Some(deadline_at);
+    }
+    if let Some(deadline_interval_ms) = patch.deadline_interval_ms {
+        job.deadline_interval_ms = Some(deadline_interval_ms);
+    }
+    if let Some(deadline_window_secs) = patch.deadline_window_secs {
+        job.deadline_window_secs = Some(deadline_window_secs);
+    }
 
     if schedule_changed {
-        job.next_run = next_run_for_schedule(&job.schedule, Utc::now())?;
+        job.next_run = next_run_for_job(&job, Utc::now())?;
     }
 
     with_connection(config, |conn| {
@@ -279,7 +293,8 @@ pub fn update_job(config: &Config, job_id: &str, patch: CronJobPatch) -> Result<
             "UPDATE cron_jobs
              SET expression = ?1, command = ?2, schedule = ?3, job_type = ?4, prompt = ?5, name = ?6,
                  session_target = ?7, model = ?8, enabled = ?9, delivery = ?10, delete_after_run = ?11,
-                 allowed_tools = ?12, next_run = ?13
+                 allowed_tools = ?12, next_run = ?13,
+                 deadline_at = ?15, deadline_interval_ms = ?16, deadline_window_secs = ?17
              WHERE id = ?14",
             params![
                 job.expression,
@@ -296,6 +311,9 @@ pub fn update_job(config: &Config, job_id: &str, patch: CronJobPatch) -> Result<
                 encode_allowed_tools(job.allowed_tools.as_ref())?,
                 job.next_run.to_rfc3339(),
                 job.id,
+                job.deadline_at.map(|d| d.to_rfc3339()),
+                job.deadline_interval_ms.map(|v| v as i64),
+                job.deadline_window_secs.map(|v| v as i64),
             ],
         )
         .context("Failed to update cron job")?;
@@ -350,7 +368,7 @@ pub fn reschedule_after_run(
             Ok(())
         })
     } else {
-        let next_run = next_run_for_schedule(&job.schedule, now)?;
+        let next_run = next_run_for_job(job, now)?;
         with_connection(config, |conn| {
             conn.execute(
                 "UPDATE cron_jobs
@@ -496,6 +514,9 @@ fn map_cron_job_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CronJob> {
     let created_at_raw: String = row.get(12)?;
     let allowed_tools_raw: Option<String> = row.get(17)?;
     let source: Option<String> = row.get(18)?;
+    let deadline_at_raw: Option<String> = row.get(19)?;
+    let deadline_interval_ms: Option<i64> = row.get(20)?;
+    let deadline_window_secs: Option<i64> = row.get(21)?;
 
     Ok(CronJob {
         id: row.get(0)?,
@@ -510,6 +531,12 @@ fn map_cron_job_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CronJob> {
         enabled: row.get::<_, i64>(9)? != 0,
         delivery,
         delete_after_run: row.get::<_, i64>(11)? != 0,
+        deadline_at: match deadline_at_raw {
+            Some(raw) => Some(parse_rfc3339(&raw).map_err(sql_conversion_error)?),
+            None => None,
+        },
+        deadline_interval_ms: deadline_interval_ms.map(|v| v.max(0) as u64),
+        deadline_window_secs: deadline_window_secs.map(|v| v.max(0) as u64),
         source: source.unwrap_or_else(|| "imperative".to_string()),
         created_at: parse_rfc3339(&created_at_raw).map_err(sql_conversion_error)?,
         next_run: parse_rfc3339(&next_run_raw).map_err(sql_conversion_error)?,
@@ -935,6 +962,9 @@ fn with_connection<T>(config: &Config, f: impl FnOnce(&Connection) -> Result<T>)
     add_column_if_missing(&conn, "delete_after_run", "INTEGER NOT NULL DEFAULT 0")?;
     add_column_if_missing(&conn, "allowed_tools", "TEXT")?;
     add_column_if_missing(&conn, "source", "TEXT DEFAULT 'imperative'")?;
+    add_column_if_missing(&conn, "deadline_at", "TEXT")?;
+    add_column_if_missing(&conn, "deadline_interval_ms", "INTEGER")?;
+    add_column_if_missing(&conn, "deadline_window_secs", "INTEGER")?;
 
     f(&conn)
 }

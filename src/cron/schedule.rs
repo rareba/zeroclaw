@@ -1,8 +1,11 @@
-use crate::cron::Schedule;
+use crate::cron::{CronJob, Schedule};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use cron::Schedule as CronExprSchedule;
 use std::str::FromStr;
+
+/// Default deadline window in seconds (1 hour).
+const DEFAULT_DEADLINE_WINDOW_SECS: u64 = 3600;
 
 pub fn next_run_for_schedule(schedule: &Schedule, from: DateTime<Utc>) -> Result<DateTime<Utc>> {
     match schedule {
@@ -40,6 +43,69 @@ pub fn next_run_for_schedule(schedule: &Schedule, from: DateTime<Utc>) -> Result
                 .ok_or_else(|| anyhow::anyhow!("every_ms overflowed DateTime"))
         }
     }
+}
+
+/// Compute the next run time for a `CronJob`, taking deadline acceleration
+/// into account.
+///
+/// When a job has `deadline_at` and `deadline_interval_ms` configured:
+/// - If `now >= deadline_at`, the deadline has passed — use normal schedule.
+/// - If the normal next_run would land inside the deadline window (i.e.
+///   `now + normal_interval >= deadline_at - deadline_window`), switch to the
+///   faster `deadline_interval_ms`.
+/// - Otherwise, use the normal schedule.
+pub fn next_run_for_job(job: &CronJob, from: DateTime<Utc>) -> Result<DateTime<Utc>> {
+    let normal_next = next_run_for_schedule(&job.schedule, from)?;
+
+    let Some(deadline_at) = job.deadline_at else {
+        return Ok(normal_next);
+    };
+    let Some(deadline_interval_ms) = job.deadline_interval_ms else {
+        return Ok(normal_next);
+    };
+
+    // Deadline already passed — revert to normal schedule.
+    if from >= deadline_at {
+        tracing::info!(
+            job_id = %job.id,
+            deadline = %deadline_at,
+            "Deadline passed, reverting to normal schedule"
+        );
+        return Ok(normal_next);
+    }
+
+    let window_secs = job
+        .deadline_window_secs
+        .unwrap_or(DEFAULT_DEADLINE_WINDOW_SECS);
+    let window = ChronoDuration::seconds(i64::try_from(window_secs).unwrap_or(i64::MAX));
+    let window_start = deadline_at - window;
+
+    // Check if we are inside the deadline window.
+    if from >= window_start || normal_next >= window_start {
+        let ms = i64::try_from(deadline_interval_ms).context("deadline_interval_ms too large")?;
+        let fast_next = from
+            .checked_add_signed(ChronoDuration::milliseconds(ms))
+            .ok_or_else(|| anyhow::anyhow!("deadline_interval_ms overflowed DateTime"))?;
+
+        // Don't schedule past the deadline itself.
+        let clamped = if fast_next > deadline_at {
+            deadline_at
+        } else {
+            fast_next
+        };
+
+        tracing::info!(
+            job_id = %job.id,
+            deadline = %deadline_at,
+            normal_next = %normal_next,
+            fast_next = %clamped,
+            deadline_interval_ms,
+            "Deadline approaching, switching to faster interval"
+        );
+        return Ok(clamped);
+    }
+
+    Ok(normal_next)
 }
 
 pub fn validate_schedule(schedule: &Schedule, now: DateTime<Utc>) -> Result<()> {
@@ -329,5 +395,136 @@ mod tests {
         } else {
             assert_ne!(next_local, next_utc);
         }
+    }
+
+    // ── Deadline-aware scheduling tests ──────────────────────────────
+
+    use crate::cron::types::{DeliveryConfig, JobType, SessionTarget};
+
+    /// Helper to build a minimal CronJob for deadline tests.
+    fn make_test_job(schedule: Schedule) -> CronJob {
+        CronJob {
+            id: "test-deadline".to_string(),
+            expression: String::new(),
+            schedule,
+            command: "echo test".to_string(),
+            prompt: None,
+            name: None,
+            job_type: JobType::Shell,
+            session_target: SessionTarget::Isolated,
+            model: None,
+            enabled: true,
+            delivery: DeliveryConfig::default(),
+            delete_after_run: false,
+            deadline_at: None,
+            deadline_interval_ms: None,
+            deadline_window_secs: None,
+            allowed_tools: None,
+            source: "imperative".to_string(),
+            created_at: Utc::now(),
+            next_run: Utc::now(),
+            last_run: None,
+            last_status: None,
+            last_output: None,
+        }
+    }
+
+    #[test]
+    fn next_run_for_job_without_deadline_returns_normal() {
+        let now = Utc.with_ymd_and_hms(2026, 3, 30, 10, 0, 0).unwrap();
+        let job = make_test_job(Schedule::Every { every_ms: 3_600_000 });
+        let next = next_run_for_job(&job, now).unwrap();
+        // Normal: 1 hour later
+        assert_eq!(next, now + ChronoDuration::hours(1));
+    }
+
+    #[test]
+    fn next_run_for_job_inside_deadline_window_uses_fast_interval() {
+        let now = Utc.with_ymd_and_hms(2026, 3, 30, 10, 0, 0).unwrap();
+        let deadline = Utc.with_ymd_and_hms(2026, 3, 30, 10, 30, 0).unwrap();
+
+        let mut job = make_test_job(Schedule::Every { every_ms: 3_600_000 }); // 1h normal
+        job.deadline_at = Some(deadline);
+        job.deadline_interval_ms = Some(60_000); // 1 minute fast
+        job.deadline_window_secs = Some(3600); // 1 hour window
+
+        let next = next_run_for_job(&job, now).unwrap();
+        // Should use 1-minute interval, not 1-hour
+        assert_eq!(next, now + ChronoDuration::minutes(1));
+    }
+
+    #[test]
+    fn next_run_for_job_outside_deadline_window_uses_normal() {
+        let now = Utc.with_ymd_and_hms(2026, 3, 30, 8, 0, 0).unwrap();
+        let deadline = Utc.with_ymd_and_hms(2026, 3, 30, 12, 0, 0).unwrap();
+
+        let mut job = make_test_job(Schedule::Every { every_ms: 60_000 }); // 1 min normal
+        job.deadline_at = Some(deadline);
+        job.deadline_interval_ms = Some(10_000); // 10s fast
+        job.deadline_window_secs = Some(3600); // 1 hour window => starts at 11:00
+
+        let next = next_run_for_job(&job, now).unwrap();
+        // Normal next: 08:01 — well before 11:00 window start, and normal_next (08:01) < 11:00
+        // So should use normal schedule
+        assert_eq!(next, now + ChronoDuration::minutes(1));
+    }
+
+    #[test]
+    fn next_run_for_job_deadline_passed_uses_normal() {
+        let now = Utc.with_ymd_and_hms(2026, 3, 30, 13, 0, 0).unwrap();
+        let deadline = Utc.with_ymd_and_hms(2026, 3, 30, 12, 0, 0).unwrap();
+
+        let mut job = make_test_job(Schedule::Every { every_ms: 3_600_000 });
+        job.deadline_at = Some(deadline);
+        job.deadline_interval_ms = Some(60_000);
+        job.deadline_window_secs = Some(3600);
+
+        let next = next_run_for_job(&job, now).unwrap();
+        // Deadline passed, reverts to normal 1-hour interval
+        assert_eq!(next, now + ChronoDuration::hours(1));
+    }
+
+    #[test]
+    fn next_run_for_job_fast_interval_clamped_to_deadline() {
+        let now = Utc.with_ymd_and_hms(2026, 3, 30, 11, 59, 50).unwrap();
+        let deadline = Utc.with_ymd_and_hms(2026, 3, 30, 12, 0, 0).unwrap();
+
+        let mut job = make_test_job(Schedule::Every { every_ms: 3_600_000 });
+        job.deadline_at = Some(deadline);
+        job.deadline_interval_ms = Some(60_000); // 1 minute, would overshoot
+        job.deadline_window_secs = Some(3600);
+
+        let next = next_run_for_job(&job, now).unwrap();
+        // 1 minute from now = 12:00:50, which is past deadline 12:00:00
+        // So should be clamped to deadline
+        assert_eq!(next, deadline);
+    }
+
+    #[test]
+    fn next_run_for_job_uses_default_window_when_not_specified() {
+        let now = Utc.with_ymd_and_hms(2026, 3, 30, 11, 30, 0).unwrap();
+        let deadline = Utc.with_ymd_and_hms(2026, 3, 30, 12, 0, 0).unwrap();
+
+        let mut job = make_test_job(Schedule::Every { every_ms: 7_200_000 }); // 2h normal
+        job.deadline_at = Some(deadline);
+        job.deadline_interval_ms = Some(60_000);
+        // No deadline_window_secs => defaults to 3600 (1h)
+        // window_start = 12:00 - 1h = 11:00, now (11:30) >= 11:00 => in window
+
+        let next = next_run_for_job(&job, now).unwrap();
+        assert_eq!(next, now + ChronoDuration::minutes(1));
+    }
+
+    #[test]
+    fn next_run_for_job_no_deadline_interval_ms_returns_normal() {
+        let now = Utc.with_ymd_and_hms(2026, 3, 30, 11, 30, 0).unwrap();
+        let deadline = Utc.with_ymd_and_hms(2026, 3, 30, 12, 0, 0).unwrap();
+
+        let mut job = make_test_job(Schedule::Every { every_ms: 3_600_000 });
+        job.deadline_at = Some(deadline);
+        // No deadline_interval_ms => no fast interval, use normal
+
+        let next = next_run_for_job(&job, now).unwrap();
+        assert_eq!(next, now + ChronoDuration::hours(1));
     }
 }
