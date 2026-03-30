@@ -1,3 +1,4 @@
+use super::circuit_breaker::CircuitBreaker;
 use super::Provider;
 use super::traits::{
     ChatMessage, ChatRequest, ChatResponse, StreamChunk, StreamEvent, StreamOptions, StreamResult,
@@ -7,6 +8,7 @@ use futures_util::{StreamExt, stream};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 // ── Provider Fallback Notification ──────────────────────────────────────
@@ -363,7 +365,7 @@ fn push_failure(
 // Loop invariant: `failures` accumulates every failed attempt so the final
 // error message gives operators a complete diagnostic trail.
 
-/// Provider wrapper with retry, fallback, auth rotation, and model failover.
+/// Provider wrapper with retry, fallback, auth rotation, model failover, and circuit breaking.
 pub struct ReliableProvider {
     providers: Vec<(String, Box<dyn Provider>)>,
     max_retries: u32,
@@ -373,6 +375,8 @@ pub struct ReliableProvider {
     key_index: AtomicUsize,
     /// Per-model fallback chains: model_name → [fallback_model_1, fallback_model_2, ...]
     model_fallbacks: HashMap<String, Vec<String>>,
+    /// Circuit breaker quarantines providers with sustained failures.
+    circuit_breaker: Arc<CircuitBreaker>,
 }
 
 impl ReliableProvider {
@@ -388,6 +392,7 @@ impl ReliableProvider {
             api_keys: Vec::new(),
             key_index: AtomicUsize::new(0),
             model_fallbacks: HashMap::new(),
+            circuit_breaker: Arc::new(CircuitBreaker::new(5, Duration::from_secs(60), 1)),
         }
     }
 
@@ -400,6 +405,12 @@ impl ReliableProvider {
     /// Set per-model fallback chains.
     pub fn with_model_fallbacks(mut self, fallbacks: HashMap<String, Vec<String>>) -> Self {
         self.model_fallbacks = fallbacks;
+        self
+    }
+
+    /// Set a custom circuit breaker (replaces the default).
+    pub fn with_circuit_breaker(mut self, cb: Arc<CircuitBreaker>) -> Self {
+        self.circuit_breaker = cb;
         self
     }
 
@@ -460,6 +471,13 @@ impl Provider for ReliableProvider {
         // retryable error, sleep with exponential backoff and retry.
         for current_model in &models {
             for (provider_name, provider) in &self.providers {
+                if !self.circuit_breaker.is_available(provider_name) {
+                    failures.push(format!(
+                        "provider={provider_name} model={current_model}: skipped (circuit breaker open)"
+                    ));
+                    continue;
+                }
+
                 let mut backoff_ms = self.base_backoff_ms;
 
                 for attempt in 0..=self.max_retries {
@@ -492,6 +510,7 @@ impl Provider for ReliableProvider {
                                     current_model,
                                 );
                             }
+                            self.circuit_breaker.record_success(provider_name);
                             return Ok(resp);
                         }
                         Err(e) => {
@@ -552,6 +571,7 @@ impl Provider for ReliableProvider {
                                     error = %error_detail,
                                     "Non-retryable error, moving on"
                                 );
+                                self.circuit_breaker.record_failure(provider_name);
                                 break;
                             }
 
@@ -568,6 +588,8 @@ impl Provider for ReliableProvider {
                                 );
                                 tokio::time::sleep(Duration::from_millis(wait)).await;
                                 backoff_ms = (backoff_ms.saturating_mul(2)).min(10_000);
+                            } else {
+                                self.circuit_breaker.record_failure(provider_name);
                             }
                         }
                     }
@@ -608,6 +630,13 @@ impl Provider for ReliableProvider {
 
         for current_model in &models {
             for (provider_name, provider) in &self.providers {
+                if !self.circuit_breaker.is_available(provider_name) {
+                    failures.push(format!(
+                        "provider={provider_name} model={current_model}: skipped (circuit breaker open)"
+                    ));
+                    continue;
+                }
+
                 let mut backoff_ms = self.base_backoff_ms;
 
                 for attempt in 0..=self.max_retries {
@@ -642,6 +671,7 @@ impl Provider for ReliableProvider {
                                     current_model,
                                 );
                             }
+                            self.circuit_breaker.record_success(provider_name);
                             return Ok(resp);
                         }
                         Err(e) => {
@@ -716,6 +746,7 @@ impl Provider for ReliableProvider {
                                     error = %error_detail,
                                     "Non-retryable error, moving on"
                                 );
+                                self.circuit_breaker.record_failure(provider_name);
                                 break;
                             }
 
@@ -732,6 +763,8 @@ impl Provider for ReliableProvider {
                                 );
                                 tokio::time::sleep(Duration::from_millis(wait)).await;
                                 backoff_ms = (backoff_ms.saturating_mul(2)).min(10_000);
+                            } else {
+                                self.circuit_breaker.record_failure(provider_name);
                             }
                         }
                     }
@@ -778,6 +811,13 @@ impl Provider for ReliableProvider {
 
         for current_model in &models {
             for (provider_name, provider) in &self.providers {
+                if !self.circuit_breaker.is_available(provider_name) {
+                    failures.push(format!(
+                        "provider={provider_name} model={current_model}: skipped (circuit breaker open)"
+                    ));
+                    continue;
+                }
+
                 let mut backoff_ms = self.base_backoff_ms;
 
                 for attempt in 0..=self.max_retries {
@@ -812,6 +852,7 @@ impl Provider for ReliableProvider {
                                     current_model,
                                 );
                             }
+                            self.circuit_breaker.record_success(provider_name);
                             return Ok(resp);
                         }
                         Err(e) => {
@@ -886,6 +927,7 @@ impl Provider for ReliableProvider {
                                     error = %error_detail,
                                     "Non-retryable error, moving on"
                                 );
+                                self.circuit_breaker.record_failure(provider_name);
                                 break;
                             }
 
@@ -902,6 +944,8 @@ impl Provider for ReliableProvider {
                                 );
                                 tokio::time::sleep(Duration::from_millis(wait)).await;
                                 backoff_ms = (backoff_ms.saturating_mul(2)).min(10_000);
+                            } else {
+                                self.circuit_breaker.record_failure(provider_name);
                             }
                         }
                     }
@@ -934,6 +978,13 @@ impl Provider for ReliableProvider {
 
         for current_model in &models {
             for (provider_name, provider) in &self.providers {
+                if !self.circuit_breaker.is_available(provider_name) {
+                    failures.push(format!(
+                        "provider={provider_name} model={current_model}: skipped (circuit breaker open)"
+                    ));
+                    continue;
+                }
+
                 let mut backoff_ms = self.base_backoff_ms;
 
                 for attempt in 0..=self.max_retries {
@@ -969,6 +1020,7 @@ impl Provider for ReliableProvider {
                                     current_model,
                                 );
                             }
+                            self.circuit_breaker.record_success(provider_name);
                             return Ok(resp);
                         }
                         Err(e) => {
@@ -1043,6 +1095,7 @@ impl Provider for ReliableProvider {
                                     error = %error_detail,
                                     "Non-retryable error, moving on"
                                 );
+                                self.circuit_breaker.record_failure(provider_name);
                                 break;
                             }
 
@@ -1059,6 +1112,8 @@ impl Provider for ReliableProvider {
                                 );
                                 tokio::time::sleep(Duration::from_millis(wait)).await;
                                 backoff_ms = (backoff_ms.saturating_mul(2)).min(10_000);
+                            } else {
+                                self.circuit_breaker.record_failure(provider_name);
                             }
                         }
                     }

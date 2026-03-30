@@ -5773,6 +5773,12 @@ pub struct ReliabilityConfig {
     /// Max retries for cron job execution attempts.
     #[serde(default = "default_scheduler_retries")]
     pub scheduler_retries: u32,
+    /// Consecutive failures before the circuit breaker quarantines a provider.
+    #[serde(default = "default_circuit_breaker_threshold")]
+    pub circuit_breaker_threshold: u32,
+    /// Seconds a provider stays quarantined before a half-open probe is allowed.
+    #[serde(default = "default_circuit_breaker_recovery_secs")]
+    pub circuit_breaker_recovery_secs: u64,
 }
 
 fn default_provider_retries() -> u32 {
@@ -5799,6 +5805,14 @@ fn default_scheduler_retries() -> u32 {
     2
 }
 
+fn default_circuit_breaker_threshold() -> u32 {
+    5
+}
+
+fn default_circuit_breaker_recovery_secs() -> u64 {
+    60
+}
+
 impl Default for ReliabilityConfig {
     fn default() -> Self {
         Self {
@@ -5811,6 +5825,8 @@ impl Default for ReliabilityConfig {
             channel_max_backoff_secs: default_channel_backoff_max_secs(),
             scheduler_poll_secs: default_scheduler_poll_secs(),
             scheduler_retries: default_scheduler_retries(),
+            circuit_breaker_threshold: default_circuit_breaker_threshold(),
+            circuit_breaker_recovery_secs: default_circuit_breaker_recovery_secs(),
         }
     }
 }

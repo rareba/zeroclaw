@@ -19,6 +19,7 @@
 pub mod anthropic;
 pub mod azure_openai;
 pub mod bedrock;
+pub mod circuit_breaker;
 pub mod claude_code;
 pub mod compatible;
 pub mod copilot;
@@ -1821,13 +1822,20 @@ pub fn create_resilient_provider_with_options(
         }
     }
 
+    let cb = std::sync::Arc::new(circuit_breaker::CircuitBreaker::new(
+        reliability.circuit_breaker_threshold,
+        std::time::Duration::from_secs(reliability.circuit_breaker_recovery_secs),
+        1,
+    ));
+
     let reliable = ReliableProvider::new(
         providers,
         reliability.provider_retries,
         reliability.provider_backoff_ms,
     )
     .with_api_keys(reliability.api_keys.clone())
-    .with_model_fallbacks(reliability.model_fallbacks.clone());
+    .with_model_fallbacks(reliability.model_fallbacks.clone())
+    .with_circuit_breaker(cb);
 
     Ok(Box::new(reliable))
 }
@@ -3251,6 +3259,8 @@ mod tests {
             channel_max_backoff_secs: 60,
             scheduler_poll_secs: 15,
             scheduler_retries: 2,
+            circuit_breaker_threshold: 5,
+            circuit_breaker_recovery_secs: 60,
         };
 
         let provider = create_resilient_provider(
@@ -3290,6 +3300,8 @@ mod tests {
             channel_max_backoff_secs: 60,
             scheduler_poll_secs: 15,
             scheduler_retries: 2,
+            circuit_breaker_threshold: 5,
+            circuit_breaker_recovery_secs: 60,
         };
 
         // Primary uses a ZAI key; fallbacks (lmstudio, ollama) should NOT
@@ -3312,6 +3324,8 @@ mod tests {
             channel_max_backoff_secs: 60,
             scheduler_poll_secs: 15,
             scheduler_retries: 2,
+            circuit_breaker_threshold: 5,
+            circuit_breaker_recovery_secs: 60,
         };
 
         let provider =
@@ -3338,6 +3352,8 @@ mod tests {
             channel_max_backoff_secs: 60,
             scheduler_poll_secs: 15,
             scheduler_retries: 2,
+            circuit_breaker_threshold: 5,
+            circuit_breaker_recovery_secs: 60,
         };
 
         let provider = create_resilient_provider("zai", Some("zai-test-key"), None, &reliability);
@@ -3370,6 +3386,8 @@ mod tests {
             channel_max_backoff_secs: 60,
             scheduler_poll_secs: 15,
             scheduler_retries: 2,
+            circuit_breaker_threshold: 5,
+            circuit_breaker_recovery_secs: 60,
         };
 
         let provider = create_resilient_provider("zai", Some("zai-test-key"), None, &reliability);
@@ -3668,6 +3686,8 @@ mod tests {
             channel_max_backoff_secs: 60,
             scheduler_poll_secs: 15,
             scheduler_retries: 2,
+            circuit_breaker_threshold: 5,
+            circuit_breaker_recovery_secs: 60,
         };
 
         // openai-codex resolves its own OAuth credential; it should not
@@ -3697,6 +3717,8 @@ mod tests {
             channel_max_backoff_secs: 60,
             scheduler_poll_secs: 15,
             scheduler_retries: 2,
+            circuit_breaker_threshold: 5,
+            circuit_breaker_recovery_secs: 60,
         };
 
         let provider = create_resilient_provider("ollama", None, None, &reliability);
