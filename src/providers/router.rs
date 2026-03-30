@@ -1,4 +1,5 @@
 use super::Provider;
+use super::complexity::score_complexity;
 use super::traits::{
     ChatMessage, ChatRequest, ChatResponse, StreamChunk, StreamEvent, StreamOptions, StreamResult,
 };
@@ -27,6 +28,9 @@ pub struct RouterProvider {
     providers: Vec<(String, Box<dyn Provider>)>,
     default_index: usize,
     default_model: String,
+    /// When true, automatically score message complexity and route to
+    /// `cheap` / `default` / `reasoning` hints when no explicit hint is provided.
+    auto_route: bool,
 }
 
 impl RouterProvider {
@@ -70,7 +74,40 @@ impl RouterProvider {
             providers,
             default_index: 0,
             default_model,
+            auto_route: false,
         }
+    }
+
+    /// Enable or disable automatic complexity-based routing.
+    pub fn with_auto_route(mut self, enabled: bool) -> Self {
+        self.auto_route = enabled;
+        self
+    }
+
+    /// Resolve a model parameter using automatic complexity scoring.
+    ///
+    /// When `auto_route` is enabled and the model string does NOT already
+    /// contain a `hint:` prefix, the conversation history is scored and the
+    /// resulting complexity hint is used for routing.
+    fn resolve_auto(&self, model: &str, messages: &[ChatMessage]) -> (usize, String) {
+        if self.auto_route && !model.starts_with("hint:") {
+            let complexity = score_complexity(messages);
+            let hint_model = complexity.route_hint();
+            tracing::info!(
+                complexity = ?complexity,
+                auto_hint = hint_model,
+                "Auto-routing based on message complexity"
+            );
+            // Try the auto hint; if no matching route exists, fall through to default
+            let resolved = self.resolve(hint_model);
+            // If resolve fell through to default (returned the hint string as model),
+            // use the original model with the default provider instead.
+            if resolved.1 == hint_model {
+                return (self.default_index, model.to_string());
+            }
+            return resolved;
+        }
+        self.resolve(model)
     }
 
     /// Resolve a model parameter to the cheapest qualifying route based on pricing.
@@ -223,7 +260,7 @@ impl Provider for RouterProvider {
         model: &str,
         temperature: f64,
     ) -> anyhow::Result<String> {
-        let (provider_idx, resolved_model) = self.resolve(model);
+        let (provider_idx, resolved_model) = self.resolve_auto(model, messages);
         let (_, provider) = &self.providers[provider_idx];
         provider
             .chat_with_history(messages, &resolved_model, temperature)
@@ -248,7 +285,7 @@ impl Provider for RouterProvider {
         model: &str,
         temperature: f64,
     ) -> anyhow::Result<ChatResponse> {
-        let (provider_idx, resolved_model) = self.resolve(model);
+        let (provider_idx, resolved_model) = self.resolve_auto(model, messages);
         let (_, provider) = &self.providers[provider_idx];
         provider
             .chat_with_tools(messages, tools, &resolved_model, temperature)
@@ -281,7 +318,7 @@ impl Provider for RouterProvider {
         temperature: f64,
         options: StreamOptions,
     ) -> BoxStream<'static, StreamResult<StreamChunk>> {
-        let (provider_idx, resolved_model) = self.resolve(model);
+        let (provider_idx, resolved_model) = self.resolve_auto(model, messages);
         let (_, provider) = &self.providers[provider_idx];
         provider.stream_chat_with_history(messages, &resolved_model, temperature, options)
     }

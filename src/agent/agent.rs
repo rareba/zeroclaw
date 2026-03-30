@@ -508,6 +508,7 @@ impl Agent {
             &config.model_routes,
             &model_name,
             &provider_runtime_options,
+            config.auto_model_router.enabled,
         )?;
 
         let dispatcher_choice = config.agent.tool_dispatcher.as_str();

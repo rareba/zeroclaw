@@ -21,6 +21,7 @@ pub mod azure_openai;
 pub mod bedrock;
 pub mod claude_code;
 pub mod compatible;
+pub mod complexity;
 pub mod copilot;
 pub mod gemini;
 pub mod gemini_cli;
@@ -1851,6 +1852,7 @@ pub fn create_routed_provider(
         model_routes,
         default_model,
         &ProviderRuntimeOptions::default(),
+        false,
     )
 }
 
@@ -1863,6 +1865,7 @@ pub fn create_routed_provider_with_options(
     model_routes: &[crate::config::ModelRouteConfig],
     default_model: &str,
     options: &ProviderRuntimeOptions,
+    auto_route: bool,
 ) -> anyhow::Result<Box<dyn Provider>> {
     if model_routes.is_empty() {
         return create_resilient_provider_with_options(
@@ -1925,11 +1928,10 @@ pub fn create_routed_provider_with_options(
         })
         .collect();
 
-    Ok(Box::new(router::RouterProvider::new(
-        providers,
-        routes,
-        default_model.to_string(),
-    )))
+    Ok(Box::new(
+        router::RouterProvider::new(providers, routes, default_model.to_string())
+            .with_auto_route(auto_route),
+    ))
 }
 
 /// Information about a supported provider for display purposes.

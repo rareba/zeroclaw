@@ -212,6 +212,10 @@ pub struct Config {
     #[serde(default)]
     pub model_routes: Vec<ModelRouteConfig>,
 
+    /// Automatic complexity-based model routing configuration.
+    #[serde(default)]
+    pub auto_model_router: AutoModelRouterConfig,
+
     /// Embedding routing rules — route `hint:<name>` to specific provider+model combos.
     #[serde(default)]
     pub embedding_routes: Vec<EmbeddingRouteConfig>,
@@ -5884,6 +5888,63 @@ pub struct ModelRouteConfig {
     pub api_key: Option<String>,
 }
 
+// ── Automatic complexity-based model routing ─────────────────────
+
+/// Configuration for the automatic complexity-based model router.
+///
+/// When enabled, conversations are scored by heuristics (message length,
+/// turn count, tool-call density, code blocks) and automatically routed to
+/// cheap, default, or reasoning models.
+///
+/// ```toml
+/// [auto_model_router]
+/// enabled = true
+/// cheap_model = "hint:fast"
+/// default_model = "hint:default"
+/// reasoning_model = "hint:reasoning"
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AutoModelRouterConfig {
+    /// Enable automatic complexity-based routing. Default: `false`.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Model (or hint) to use for simple messages. Default: `"hint:cheap"`.
+    #[serde(default = "AutoModelRouterConfig::default_cheap")]
+    pub cheap_model: String,
+
+    /// Model (or hint) to use for moderate messages. Default: `"hint:default"`.
+    #[serde(default = "AutoModelRouterConfig::default_default")]
+    pub default_model: String,
+
+    /// Model (or hint) to use for complex messages. Default: `"hint:reasoning"`.
+    #[serde(default = "AutoModelRouterConfig::default_reasoning")]
+    pub reasoning_model: String,
+}
+
+impl AutoModelRouterConfig {
+    fn default_cheap() -> String {
+        "hint:cheap".to_string()
+    }
+    fn default_default() -> String {
+        "hint:default".to_string()
+    }
+    fn default_reasoning() -> String {
+        "hint:reasoning".to_string()
+    }
+}
+
+impl Default for AutoModelRouterConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            cheap_model: Self::default_cheap(),
+            default_model: Self::default_default(),
+            reasoning_model: Self::default_reasoning(),
+        }
+    }
+}
+
 // ── Embedding routing ───────────────────────────────────────────
 
 /// Route an embedding hint to a specific provider + model.
@@ -8883,6 +8944,7 @@ impl Default for Config {
             skills: SkillsConfig::default(),
             pipeline: PipelineConfig::default(),
             model_routes: Vec::new(),
+            auto_model_router: AutoModelRouterConfig::default(),
             embedding_routes: Vec::new(),
             heartbeat: HeartbeatConfig::default(),
             cron: CronConfig::default(),
@@ -11310,6 +11372,7 @@ auto_save = true
             skills: SkillsConfig::default(),
             pipeline: PipelineConfig::default(),
             model_routes: Vec::new(),
+            auto_model_router: AutoModelRouterConfig::default(),
             embedding_routes: Vec::new(),
             query_classification: QueryClassificationConfig::default(),
             heartbeat: HeartbeatConfig {
@@ -11899,6 +11962,7 @@ default_temperature = 0.7
             skills: SkillsConfig::default(),
             pipeline: PipelineConfig::default(),
             model_routes: Vec::new(),
+            auto_model_router: AutoModelRouterConfig::default(),
             embedding_routes: Vec::new(),
             query_classification: QueryClassificationConfig::default(),
             heartbeat: HeartbeatConfig::default(),

@@ -3651,6 +3651,7 @@ pub async fn run(
         &config.model_routes,
         &model_name,
         &provider_runtime_options,
+        config.auto_model_router.enabled,
     )?;
 
     let model_switch_callback = get_model_switch_state();
@@ -4016,6 +4017,7 @@ pub async fn run(
                             &config.model_routes,
                             &new_model,
                             &provider_runtime_options,
+                            config.auto_model_router.enabled,
                         )?;
 
                         provider_name = new_provider;
@@ -4327,6 +4329,7 @@ pub async fn run(
                                 &config.model_routes,
                                 &new_model,
                                 &provider_runtime_options,
+                                config.auto_model_router.enabled,
                             )?;
 
                             provider_name = new_provider;
@@ -4604,6 +4607,7 @@ pub async fn process_message(
         &config.model_routes,
         &model_name,
         &provider_runtime_options,
+        config.auto_model_router.enabled,
     )?;
 
     let hardware_rag: Option<crate::rag::HardwareRag> = config
