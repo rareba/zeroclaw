@@ -1806,6 +1806,14 @@ pub struct MultimodalConfig {
     /// Only used when `vision_provider` is set.
     #[serde(default)]
     pub vision_model: Option<String>,
+    /// Cache images to disk before context pruning so they can be re-read.
+    /// Default: `true`.
+    #[serde(default = "default_media_cache_enabled")]
+    pub media_cache_enabled: bool,
+    /// Maximum age (in hours) for cached images before automatic cleanup.
+    /// Default: `24`.
+    #[serde(default = "default_media_cache_max_age_hours")]
+    pub media_cache_max_age_hours: u64,
 }
 
 fn default_multimodal_max_images() -> usize {
@@ -1814,6 +1822,14 @@ fn default_multimodal_max_images() -> usize {
 
 fn default_multimodal_max_image_size_mb() -> usize {
     5
+}
+
+fn default_media_cache_enabled() -> bool {
+    true
+}
+
+fn default_media_cache_max_age_hours() -> u64 {
+    24
 }
 
 impl MultimodalConfig {
@@ -1833,6 +1849,8 @@ impl Default for MultimodalConfig {
             allow_remote_fetch: false,
             vision_provider: None,
             vision_model: None,
+            media_cache_enabled: default_media_cache_enabled(),
+            media_cache_max_age_hours: default_media_cache_max_age_hours(),
         }
     }
 }

@@ -8,6 +8,7 @@ use zeroclaw_macros::Configurable;
 
 use std::sync::Arc;
 
+use crate::agent::media_cache::MediaCache;
 use crate::memory::traits::Memory;
 use crate::providers::traits::{ChatMessage, Provider};
 
@@ -219,6 +220,7 @@ pub struct ContextCompressor {
     config: ContextCompressionConfig,
     context_window: usize,
     memory: Option<Arc<dyn Memory>>,
+    media_cache: Option<MediaCache>,
 }
 
 impl ContextCompressor {
@@ -227,6 +229,7 @@ impl ContextCompressor {
             config,
             context_window,
             memory: None,
+            media_cache: None,
         }
     }
 
@@ -234,6 +237,13 @@ impl ContextCompressor {
     /// old messages are discarded. Without this, compressed facts are lost.
     pub fn with_memory(mut self, memory: Arc<dyn Memory>) -> Self {
         self.memory = Some(memory);
+        self
+    }
+
+    /// Attach a media cache so images in pruned messages are saved to disk
+    /// before being discarded.
+    pub fn with_media_cache(mut self, cache: MediaCache) -> Self {
+        self.media_cache = Some(cache);
         self
     }
 
@@ -463,6 +473,26 @@ impl ContextCompressor {
                 tracing::debug!(
                     "Saved compression summary to memory before discarding {message_count} messages"
                 );
+            }
+        }
+
+        // Cache images from the messages about to be pruned.
+        if let Some(ref cache) = self.media_cache {
+            let middle_slice = &history[start..end];
+            match cache.save_images(middle_slice).await {
+                Ok(cached) if !cached.is_empty() => {
+                    tracing::debug!(
+                        count = cached.len(),
+                        "Cached images from pruned messages to media cache"
+                    );
+                    // Rewrite image markers in the messages being pruned so the
+                    // summary preserves the cached-path reference.
+                    MediaCache::rewrite_markers(&mut history[start..end], &cached);
+                }
+                Err(e) => {
+                    tracing::debug!("Media cache save failed (non-fatal): {e}");
+                }
+                _ => {}
             }
         }
 

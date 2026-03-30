@@ -1,3 +1,4 @@
+use crate::agent::media_cache::MediaCache;
 use crate::providers::traits::ChatMessage;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -98,6 +99,43 @@ fn protected_indices(messages: &[ChatMessage], keep_recent: usize) -> Vec<bool> 
 // ---------------------------------------------------------------------------
 // Public entry point
 // ---------------------------------------------------------------------------
+
+/// Cache-aware variant of [`prune_history`]. When a `MediaCache` is provided,
+/// images in messages that will be dropped are saved to disk first and their
+/// markers rewritten to cached-path references.
+pub async fn prune_history_with_cache(
+    messages: &mut Vec<ChatMessage>,
+    config: &HistoryPrunerConfig,
+    media_cache: Option<&MediaCache>,
+) -> PruneStats {
+    if let Some(cache) = media_cache {
+        if config.enabled && !messages.is_empty() {
+            let protected = protected_indices(messages, config.keep_recent);
+            let candidates: Vec<ChatMessage> = messages
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| !protected[*i])
+                .map(|(_, m)| m.clone())
+                .collect();
+            if !candidates.is_empty() {
+                match cache.save_images(&candidates).await {
+                    Ok(cached) if !cached.is_empty() => {
+                        tracing::debug!(
+                            count = cached.len(),
+                            "Cached images before history pruning"
+                        );
+                        MediaCache::rewrite_markers(messages, &cached);
+                    }
+                    Err(e) => {
+                        tracing::debug!("Media cache save failed (non-fatal): {e}");
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    prune_history(messages, config)
+}
 
 pub fn prune_history(messages: &mut Vec<ChatMessage>, config: &HistoryPrunerConfig) -> PruneStats {
     let messages_before = messages.len();
