@@ -35,11 +35,29 @@ export interface ToolSpec {
 export interface CronJob {
   id: string;
   name: string | null;
+  expression: string;
   command: string;
+  prompt: string | null;
+  job_type: string;
+  schedule: unknown;
+  enabled: boolean;
+  delivery: unknown;
+  delete_after_run: boolean;
+  created_at: string;
   next_run: string;
   last_run: string | null;
   last_status: string | null;
-  enabled: boolean;
+  last_output: string | null;
+}
+
+export interface CronRun {
+  id: number;
+  job_id: string;
+  started_at: string;
+  finished_at: string;
+  status: string;
+  output: string | null;
+  duration_ms: number | null;
 }
 
 export interface Integration {
@@ -88,6 +106,24 @@ export interface CliTool {
   category: string;
 }
 
+export interface Session {
+  session_id: string;
+  created_at: string;
+  last_activity: string;
+  message_count: number;
+  name?: string;
+}
+
+export interface ChannelDetail {
+  name: string;
+  type: string;
+  enabled: boolean;
+  status: 'active' | 'inactive' | 'error';
+  message_count: number;
+  last_message_at: string | null;
+  health: 'healthy' | 'degraded' | 'down';
+}
+
 export interface SSEEvent {
   type: string;
   timestamp?: string;
@@ -95,11 +131,41 @@ export interface SSEEvent {
 }
 
 export interface WsMessage {
-  type: 'message' | 'chunk' | 'tool_call' | 'tool_result' | 'done' | 'error';
+  type:
+    | 'message'
+    | 'chunk'
+    | 'chunk_reset'
+    | 'thinking'
+    | 'tool_call'
+    | 'tool_result'
+    | 'done'
+    | 'error'
+    | 'session_start'
+    | 'connected'
+    | 'cron_result';
   content?: string;
   full_response?: string;
   name?: string;
   args?: any;
   output?: string;
   message?: string;
+  code?: string;
+  session_id?: string;
+  resumed?: boolean;
+  message_count?: number;
+  timestamp?: string;
+  job_id?: string;
+  success?: boolean;
+}
+
+/** Row from GET /api/sessions/{id}/messages */
+export interface SessionMessageRow {
+  role: string;
+  content: string;
+}
+
+export interface SessionMessagesResponse {
+  session_id: string;
+  messages: SessionMessageRow[];
+  session_persistence: boolean;
 }
