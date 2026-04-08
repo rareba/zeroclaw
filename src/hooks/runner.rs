@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use futures_util::{future::join_all, FutureExt};
+use futures_util::{FutureExt, future::join_all};
 use serde_json::Value;
 use std::panic::AssertUnwindSafe;
 use tracing::info;
@@ -318,8 +318,8 @@ impl HookRunner {
 mod tests {
     use super::*;
     use async_trait::async_trait;
-    use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicU32, Ordering};
 
     /// A hook that records how many times void events fire.
     struct CountingHook {
@@ -479,5 +479,71 @@ mod tests {
             HookResult::Continue(result) => assert_eq!(result, "HELLO_done"),
             HookResult::Cancel(_) => panic!("should not cancel"),
         }
+    }
+
+    /// A hook that records session start and end events.
+    struct SessionCountingHook {
+        starts: Arc<AtomicU32>,
+        ends: Arc<AtomicU32>,
+    }
+
+    impl SessionCountingHook {
+        fn new() -> (Self, Arc<AtomicU32>, Arc<AtomicU32>) {
+            let starts = Arc::new(AtomicU32::new(0));
+            let ends = Arc::new(AtomicU32::new(0));
+            (
+                Self {
+                    starts: starts.clone(),
+                    ends: ends.clone(),
+                },
+                starts,
+                ends,
+            )
+        }
+    }
+
+    #[async_trait]
+    impl HookHandler for SessionCountingHook {
+        fn name(&self) -> &str {
+            "session-counter"
+        }
+        async fn on_session_start(&self, _session_id: &str, _channel: &str) {
+            self.starts.fetch_add(1, Ordering::SeqCst);
+        }
+        async fn on_session_end(&self, _session_id: &str, _channel: &str) {
+            self.ends.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn fire_session_start_and_end() {
+        let mut runner = HookRunner::new();
+        let (hook, starts, ends) = SessionCountingHook::new();
+        runner.register(Box::new(hook));
+
+        assert_eq!(starts.load(Ordering::SeqCst), 0);
+        assert_eq!(ends.load(Ordering::SeqCst), 0);
+
+        runner.fire_session_start("sess-1", "cli").await;
+        assert_eq!(starts.load(Ordering::SeqCst), 1);
+        assert_eq!(ends.load(Ordering::SeqCst), 0);
+
+        runner.fire_session_end("sess-1", "cli").await;
+        assert_eq!(starts.load(Ordering::SeqCst), 1);
+        assert_eq!(ends.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn fire_session_end_dispatches_to_all_handlers() {
+        let mut runner = HookRunner::new();
+        let (h1, _, ends1) = SessionCountingHook::new();
+        let (h2, _, ends2) = SessionCountingHook::new();
+        runner.register(Box::new(h1));
+        runner.register(Box::new(h2));
+
+        runner.fire_session_end("sess-x", "telegram").await;
+
+        assert_eq!(ends1.load(Ordering::SeqCst), 1);
+        assert_eq!(ends2.load(Ordering::SeqCst), 1);
     }
 }

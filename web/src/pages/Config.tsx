@@ -1,125 +1,119 @@
-import { useState, useEffect } from 'react';
 import {
   Settings,
   Save,
   CheckCircle,
   AlertTriangle,
   ShieldAlert,
+  Code,
+  SlidersHorizontal,
 } from 'lucide-react';
-import { getConfig, putConfig } from '@/lib/api';
+import { t } from '@/lib/i18n';
+import { useConfigState } from './config/useConfigState';
+import ConfigFormView from './config/ConfigFormView';
+import ConfigTomlEditor from './config/ConfigTomlEditor';
 
 export default function Config() {
-  const [config, setConfig] = useState('');
-  const [loading, setLoading] = useState(true);
-  const [saving, setSaving] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [success, setSuccess] = useState<string | null>(null);
-
-  useEffect(() => {
-    getConfig()
-      .then((data) => {
-        // The API may return either a raw string or a JSON string
-        setConfig(typeof data === 'string' ? data : JSON.stringify(data, null, 2));
-      })
-      .catch((err) => setError(err.message))
-      .finally(() => setLoading(false));
-  }, []);
-
-  const handleSave = async () => {
-    setSaving(true);
-    setError(null);
-    setSuccess(null);
-    try {
-      await putConfig(config);
-      setSuccess('Configuration saved successfully.');
-    } catch (err: unknown) {
-      setError(err instanceof Error ? err.message : 'Failed to save configuration');
-    } finally {
-      setSaving(false);
-    }
-  };
-
-  // Auto-dismiss success after 4 seconds
-  useEffect(() => {
-    if (!success) return;
-    const timer = setTimeout(() => setSuccess(null), 4000);
-    return () => clearTimeout(timer);
-  }, [success]);
+  const {
+    parsedConfig,
+    rawToml,
+    mode,
+    loading,
+    saving,
+    error,
+    success,
+    parseError,
+    updateField,
+    switchMode,
+    updateRawToml,
+    save,
+  } = useConfigState();
 
   if (loading) {
     return (
       <div className="flex items-center justify-center h-64">
-        <div className="animate-spin rounded-full h-8 w-8 border-2 border-blue-500 border-t-transparent" />
+        <div className="h-8 w-8 border-2 rounded-full animate-spin" style={{ borderColor: 'var(--pc-border)', borderTopColor: 'var(--pc-accent)' }} />
       </div>
     );
   }
 
   return (
-    <div className="p-6 space-y-6">
+    <div className="flex flex-col h-full p-6 gap-4 animate-fade-in overflow-hidden">
       {/* Header */}
-      <div className="flex items-center justify-between">
+      <div className="flex items-center justify-between flex-shrink-0">
         <div className="flex items-center gap-2">
-          <Settings className="h-5 w-5 text-blue-400" />
-          <h2 className="text-base font-semibold text-white">Configuration</h2>
+          <Settings className="h-5 w-5" style={{ color: 'var(--pc-accent)' }} />
+          <h2 className="text-sm font-semibold uppercase tracking-wider" style={{ color: 'var(--pc-text-primary)' }}>{t('config.configuration_title')}</h2>
         </div>
-        <button
-          onClick={handleSave}
-          disabled={saving}
-          className="flex items-center gap-2 bg-blue-600 hover:bg-blue-700 text-white text-sm font-medium px-4 py-2 rounded-lg transition-colors disabled:opacity-50"
-        >
-          <Save className="h-4 w-4" />
-          {saving ? 'Saving...' : 'Save'}
-        </button>
+        <div className="flex items-center gap-3">
+          {/* Mode toggle */}
+          <div className="flex rounded-xl overflow-hidden border" style={{ borderColor: 'var(--pc-border)' }}>
+            <button
+              type="button"
+              onClick={() => switchMode('form')}
+              className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium transition-colors"
+              style={{
+                background: mode === 'form' ? 'var(--pc-accent)' : 'var(--pc-bg-surface)',
+                color: mode === 'form' ? 'white' : 'var(--pc-text-secondary)',
+              }}
+            >
+              <SlidersHorizontal className="h-3.5 w-3.5" />
+              {t('config.mode.form')}
+            </button>
+            <button
+              type="button"
+              onClick={() => switchMode('advanced')}
+              className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium transition-colors"
+              style={{
+                background: mode === 'advanced' ? 'var(--pc-accent)' : 'var(--pc-bg-surface)',
+                color: mode === 'advanced' ? 'white' : 'var(--pc-text-secondary)',
+              }}
+            >
+              <Code className="h-3.5 w-3.5" />
+              {t('config.mode.advanced')}
+            </button>
+          </div>
+
+          <button onClick={save} disabled={saving} className="btn-electric flex items-center gap-2 text-sm px-4 py-2">
+            <Save className="h-4 w-4" />{saving ? t('config.saving') : t('config.save')}
+          </button>
+        </div>
       </div>
 
       {/* Sensitive fields note */}
-      <div className="flex items-start gap-3 bg-yellow-900/20 border border-yellow-700/40 rounded-lg p-4">
-        <ShieldAlert className="h-5 w-5 text-yellow-400 flex-shrink-0 mt-0.5" />
+      <div className="flex items-start gap-3 rounded-2xl p-4 border flex-shrink-0" style={{ borderColor: 'rgba(255, 170, 0, 0.2)', background: 'rgba(255, 170, 0, 0.05)' }}>
+        <ShieldAlert className="h-5 w-5 flex-shrink-0 mt-0.5" style={{ color: 'var(--color-status-warning)' }} />
         <div>
-          <p className="text-sm text-yellow-300 font-medium">
-            Sensitive fields are masked
+          <p className="text-sm font-medium" style={{ color: 'var(--color-status-warning)' }}>
+            {t('config.sensitive_title')}
           </p>
-          <p className="text-sm text-yellow-400/70 mt-0.5">
-            API keys, tokens, and passwords are hidden for security. To update a
-            masked field, replace the entire masked value with your new value.
+          <p className="text-sm mt-0.5" style={{ color: 'rgba(255, 170, 0, 0.7)' }}>
+            {t('config.sensitive_hint')}
           </p>
         </div>
       </div>
 
       {/* Success message */}
       {success && (
-        <div className="flex items-center gap-2 bg-green-900/30 border border-green-700 rounded-lg p-3">
-          <CheckCircle className="h-4 w-4 text-green-400 flex-shrink-0" />
-          <span className="text-sm text-green-300">{success}</span>
+        <div className="flex items-center gap-2 rounded-xl p-3 border animate-fade-in flex-shrink-0" style={{ borderColor: 'rgba(0, 230, 138, 0.2)', background: 'rgba(0, 230, 138, 0.06)' }}>
+          <CheckCircle className="h-4 w-4 flex-shrink-0" style={{ color: 'var(--color-status-success)' }} />
+          <span className="text-sm" style={{ color: 'var(--color-status-success)' }}>{success}</span>
         </div>
       )}
 
-      {/* Error message */}
-      {error && (
-        <div className="flex items-center gap-2 bg-red-900/30 border border-red-700 rounded-lg p-3">
-          <AlertTriangle className="h-4 w-4 text-red-400 flex-shrink-0" />
-          <span className="text-sm text-red-300">{error}</span>
+      {/* Error / parse error message */}
+      {(error || parseError) && (
+        <div className="flex items-center gap-2 rounded-xl p-3 border animate-fade-in flex-shrink-0" style={{ borderColor: 'rgba(239, 68, 68, 0.2)', background: 'rgba(239, 68, 68, 0.06)' }}>
+          <AlertTriangle className="h-4 w-4 flex-shrink-0" style={{ color: 'var(--color-status-error)' }} />
+          <span className="text-sm" style={{ color: 'var(--color-status-error)' }}>{error || parseError}</span>
         </div>
       )}
 
-      {/* Config Editor */}
-      <div className="bg-gray-900 rounded-xl border border-gray-800 overflow-hidden">
-        <div className="flex items-center justify-between px-4 py-2 border-b border-gray-800 bg-gray-800/50">
-          <span className="text-xs text-gray-400 font-medium uppercase tracking-wider">
-            TOML Configuration
-          </span>
-          <span className="text-xs text-gray-500">
-            {config.split('\n').length} lines
-          </span>
-        </div>
-        <textarea
-          value={config}
-          onChange={(e) => setConfig(e.target.value)}
-          spellCheck={false}
-          className="w-full min-h-[500px] bg-gray-950 text-gray-200 font-mono text-sm p-4 resize-y focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-inset"
-          style={{ tabSize: 4 }}
-        />
-      </div>
+      {/* Content: Form or TOML editor */}
+      {mode === 'form' ? (
+        <ConfigFormView config={parsedConfig} onUpdate={updateField} />
+      ) : (
+        <ConfigTomlEditor value={rawToml} onChange={updateRawToml} />
+      )}
     </div>
   );
 }
